@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
 import matplotlib as mpl
-
+from collections import defaultdict
 
 # === Optional: Enable dual skip check (also skip if in results.txt or folder exist) ===
 ENABLE_RESULTS_TXT_SKIP = True
@@ -304,6 +304,10 @@ def plot_module_mean_histograms():
         means = [np.mean(vals) for vals in data_dict.values()]
         mean_of_means = np.mean(means)
 
+        for module_name, vals in sorted(data_dict.items()):
+            module_mean = float(np.mean(vals))
+            print(f"{title} | Module: {module_name} → Mean = {module_mean:.4f}")
+
         plt.figure(figsize=(8,6), dpi=300)
         plt.hist(means, bins=10, color="#1F77B4", edgecolor='black', alpha=0.7)
         plt.axvline(mean_of_means, color='red', linestyle='--', label=f"Mean of means = {mean_of_means:.4f}")
@@ -345,6 +349,81 @@ def reset_state():
     existing_result_keys.clear()
 
 
+def _plot_self_cross_hist_for_buckets(buckets, title_prefix, x_label, file_prefix):
+    os.makedirs("plots/performance", exist_ok=True)
+    BLUE = "#1F77B4"
+    ORANGE = "#FF7F0E"
+
+    def _plot_one(drop_key, data_self, data_cross, suffix):
+        all_vals = np.array(list(data_self) + list(data_cross))
+        if len(all_vals) == 0:
+            return
+
+        bins = np.histogram_bin_edges(all_vals, bins="auto")
+
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
+        if len(data_self) > 0:
+            plt.hist(data_self, bins=bins, alpha=0.55, edgecolor="black",
+                     label=f"SELF (n={len(data_self)})", color=BLUE)
+            plt.axvline(np.mean(data_self), linestyle="--", linewidth=1.8, color=BLUE,
+                        label=f"SELF mean = {np.mean(data_self):.4f}")
+        if len(data_cross) > 0:
+            plt.hist(data_cross, bins=bins, alpha=0.55, edgecolor="black",
+                     label=f"CROSS (n={len(data_cross)})", color=ORANGE)
+            plt.axvline(np.mean(data_cross), linestyle="--", linewidth=1.8, color=ORANGE,
+                        label=f"CROSS mean = {np.mean(data_cross):.4f}")
+
+        title = f"{title_prefix} – Dropout {drop_key}" if suffix else f"{title_prefix}"
+        plt.title(title)
+        plt.xlabel(x_label)
+        plt.ylabel("Frequency")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.5)
+        out_name = f"plots/performance/{file_prefix}_{suffix}.pdf" if suffix else f"plots/performance/{file_prefix}_ALL.pdf"
+        plt.tight_layout()
+        plt.savefig(out_name)
+        plt.close()
+
+    for drop_key in sorted(buckets.keys()):
+        data_self = buckets[drop_key].get("SELF", [])
+        data_cross = buckets[drop_key].get("CROSS", [])
+        _plot_one(drop_key, data_self, data_cross, f"dropout_{drop_key}")
+
+    all_self = []
+    all_cross = []
+    for d in buckets.values():
+        all_self.extend(d.get("SELF", []))
+        all_cross.extend(d.get("CROSS", []))
+    _plot_one(None, all_self, all_cross, suffix=None)
+
+
+def plot_self_cross_validation_histograms():
+
+    # --- Create buckets for Fractional RMS Improvement
+    frac_buckets = defaultdict(lambda: {"SELF": [], "CROSS": []})
+    for (group_type, dropout_val), vals in dropout_group_results.items():
+        frac_buckets[dropout_val][group_type].extend(vals)
+
+    _plot_self_cross_hist_for_buckets(
+        buckets=frac_buckets,
+        title_prefix="Fractional RMS Improvement (SELF vs CROSS)",
+        x_label="Fractional RMS Improvement",
+        file_prefix="hist_frac"
+    )
+
+    # --- Create buckets for Coherent Noise Ratio
+    coh_buckets = defaultdict(lambda: {"SELF": [], "CROSS": []})
+    for (group_type, dropout_val), vals in dropout_coherent_group_results.items():
+        coh_buckets[dropout_val][group_type].extend(vals)
+
+    _plot_self_cross_hist_for_buckets(
+        buckets=coh_buckets,
+        title_prefix="Coherent Noise Ratio (corr/uncorr)",
+        x_label="Coherent Noise Ratio (corr/uncorr)",
+        file_prefix="hist_coh"
+    )
+
+
 
 if __name__ == '__main__':
 
@@ -380,8 +459,7 @@ if __name__ == '__main__':
             plot_performance.nodes_per_layer = nodes_per_layer
             plot_performance.dropout_rate = dropout_rate
 
-            frac_impr, coh_ratio_mean = plot_performance.main()
-            frac_impr_mean = np.mean(frac_impr)
+            frac_impr_mean, coh_ratio_mean = plot_performance.main()
 
             register_result(test_module, train_module, nodes_per_layer, dropout_rate,
                             frac_impr_mean, coh_ratio_mean)
@@ -440,9 +518,15 @@ if __name__ == '__main__':
     def count_trained_modules(train_module_name):
         return len(re.findall(r'ML_[A-Z0-9]+', train_module_name))
 
+    #Debug layer results
+    print("Layer results content:")
+    for k, v in layer_results.items():
+        print(k, v)
+
     for (evaluate_module, train_module, layer_key), values in layer_results.items():
         num_trained = count_trained_modules(train_module)
         group_type = "SELF" if is_self(evaluate_module, train_module) else "CROSS"
+        print(f"Group: {(group_type, num_trained)} | Values to extend: {values}")
         trained_group_results[(group_type, num_trained)].extend(values)
         trained_coherent_group_results[(group_type, num_trained)].extend(
            coherent_results[(evaluate_module, train_module, layer_key)]
@@ -458,4 +542,4 @@ if __name__ == '__main__':
 
     plot_and_save_graphs()
     plot_module_mean_histograms()
-
+    plot_self_cross_validation_histograms()
