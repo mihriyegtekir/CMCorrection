@@ -33,7 +33,7 @@ APPLY_ARCH_FILTER_TO_AGGREGATES = True  # apply layer filter to ALL existing cha
 GENERATE_CM_PLOTS = False
 
 #Create a CM Profile plot for every models include all eval modules
-RUN_GLOBAL_CM_PROFILES = True   # Set to False to skip this part entirely
+RUN_GLOBAL_CM_PROFILES = False   # Set to False to skip this part entirely
 # Exclude specific train_module strings from global_cm_profiles
 EXCLUDE_TRAIN_MODULES = [
     "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192_ML_F3W_WXIH0193_ML_F3W_WXIH0194_ML_F3W_WXIH0196_ML_F3W_WXIH0197"
@@ -47,9 +47,311 @@ MODULES_FOR_GLOBAL_CM_PROFILES = [
 
 # === Noise Fractions Config ===
 ENABLE_NOISE_FRACTIONS_PLOT = True         # Enable/disable coherent/incoherent noise plots
-NOISE_FRACTIONS_MODULES = ["ML_F3W_WXIH0190", "ML_F3W_WXIH0191" "ML_F3W_WXIH0194", "ML_F3W_WXIH0197", "ML_F3W_WXIH0198"]               # [] → all eval modules, or specify list of module names
-ARCH_FILTER = (512, 512, 512, 512, 64)     # Only run for models with this architecture; set to None to disable
+NOISE_FRACTIONS_MODULES = ["ML_F3W_WXIH0197"]               # [] → all eval modules, or specify list of module names
 
+# ===================== Global Cov/Cor (concatenate across eval modules) =====================
+
+# --- Config flags ---
+ENABLE_GLOBAL_COVCORR = False
+GLOBAL_COVCORR_ROOT = os.path.join("plots", "performance", "compare_channels", "global_cov_corr")
+
+GLOBAL_COVCORR_REQUIRE_DR0 = True
+GLOBAL_COVCORR_ALL_DR0_MODELS = True
+
+# -------------------------------------------------------------------------------------------
+
+def _get_eval_modules_from_train_module(train_module: str) -> list:
+    """
+    Parse eval modules from train_module string.
+    Example:
+        'ML_F3W_WXIH0190_ML_F3W_WXIH0191' ->
+        ['ML_F3W_WXIH0190', 'ML_F3W_WXIH0191']
+    """
+    if not isinstance(train_module, str) or "ML_" not in train_module:
+        return []
+
+    parts = train_module.split("_ML_")
+    tokens = []
+    for i, p in enumerate(parts):
+        if i == 0:
+            tok = p if p.startswith("ML_") else ("ML_" + p)
+        else:
+            tok = "ML_" + p
+        tokens.append(tok)
+
+    print(f"[global-covcorr] Parsed eval modules from '{train_module}': {tokens}")
+    return tokens
+
+def _iter_bundles_for(train_module: str, model_name: str):
+    """
+    Yield (eval_module, bundle_path, meta) for each eval module.
+    Bundle path is always:
+        BASE_DIR/<EVAL>/<TRAIN>/<MODEL>/predictions_bundle.pkl.gz
+    """
+    eval_modules = _get_eval_modules_from_train_module(train_module)
+    if not eval_modules:
+        print(f"[global-covcorr] WARN: Could not parse any eval modules from: {train_module}")
+        return
+
+    found_any = False
+    for emod in eval_modules:
+        bundle_path = os.path.join(
+            BASE_DIR, emod, train_module, model_name, "predictions_bundle.pkl.gz"
+        )
+        if not os.path.exists(bundle_path):
+            # Helpful diagnostics: show what folders do exist under BASE_DIR/<EVAL>/<TRAIN>
+            probe_dir = os.path.join(BASE_DIR, emod, train_module)
+            print(f"[global-covcorr] MISSING: {bundle_path}")
+            if not os.path.exists(probe_dir):
+                print(f"[global-covcorr] NOTE: Directory does not exist: {probe_dir}")
+                # List what we DO have for this eval module to help spot typos
+                probe_parent = os.path.join(BASE_DIR, emod)
+                if os.path.isdir(probe_parent):
+                    try:
+                        kids = sorted(os.listdir(probe_parent))
+                        print(f"[global-covcorr] Existing under {probe_parent}: {kids[:10]}{' ...' if len(kids)>10 else ''}")
+                    except Exception:
+                        pass
+            continue
+
+        try:
+            with gzip.open(bundle_path, "rb") as f:
+                b = pickle.load(f)
+            meta = b.get("meta", {})
+            found_any = True
+            print(f"[global-covcorr] FOUND bundle for eval='{emod}': {bundle_path}")
+            yield emod, bundle_path, meta
+        except Exception as e:
+            print(f"[global-covcorr] WARN: cannot open {bundle_path}: {e}")
+
+    if not found_any:
+        print(f"[global-covcorr] SKIP: no bundles for any eval under train='{train_module}', model='{model_name}'")
+
+
+def _load_frames_from_bundle(bundle_path: str):
+    """
+    Load frames and meta from a predictions bundle.
+    Returns (true_df, pred_df, cm_df, meta)
+    """
+    with gzip.open(bundle_path, "rb") as f:
+        b = pickle.load(f)
+    frames = b.get("frames", {})
+    meta   = b.get("meta", {})
+    return frames.get("true"), frames.get("pred"), frames.get("cm"), meta
+
+
+def _align_columns_or_union(dfs: list, kind: str) -> pd.DataFrame:
+    """
+    Row-wise concatenate DataFrames from different eval modules as if they were new events.
+    If columns differ, take the union and reindex. Always reset/ignore the index.
+    """
+    if not dfs:
+        return pd.DataFrame()
+    col_sets = [tuple(df.columns) for df in dfs]
+    if all(cols == col_sets[0] for cols in col_sets):
+        return pd.concat(dfs, axis=0, ignore_index=True)
+    union_cols = sorted(set().union(*[df.columns for df in dfs]))
+    print(f"[global-covcorr] INFO: {kind} columns differ; using union of {len(union_cols)} cols.")
+    dfs_re = [df.reindex(columns=union_cols) for df in dfs]
+    return pd.concat(dfs_re, axis=0, ignore_index=True)
+
+
+def _save_global_bundle_and_plots(
+    out_dir: str,
+    train_module: str,
+    model_name: str,
+    cov_true: pd.DataFrame, corr_true: pd.DataFrame,
+    cov_pred: pd.DataFrame, corr_pred: pd.DataFrame,
+    cov_res:  pd.DataFrame, corr_res:  pd.DataFrame,
+    true_df: pd.DataFrame, pred_df: pd.DataFrame,
+    residual_df: pd.DataFrame, cm_df: pd.DataFrame,
+    nch_per_erx: int
+):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Info file
+    with open(os.path.join(out_dir, "info.txt"), "w") as f:
+        f.write(f"train_module: {train_module}\n")
+        f.write(f"model_name: {model_name}\n")
+        f.write(f"events_total: {true_df.shape[0]}\n")
+        f.write(f"channels: {true_df.shape[1]}\n")
+
+    bundle = {
+        "version": 1,
+        "created_utc": datetime.utcnow().isoformat() + "Z",
+        "meta": {
+            "scope": "global_covcorr",
+            "train_module": train_module,
+            "model_name": model_name,
+            "nch_per_erx": int(nch_per_erx),
+        },
+        "frames": {
+            "true": true_df,
+            "pred": pred_df,
+            "residual": residual_df,
+            "cm": cm_df,
+        },
+        "covcorr": {
+            "true": {"cov": cov_true, "corr": corr_true},
+            "pred": {"cov": cov_pred, "corr": corr_pred},
+            "residual": {"cov": cov_res, "corr": corr_res},
+        },
+    }
+    out_pkl = os.path.join(out_dir, "global_bundle.pkl.gz")
+    with gzip.open(out_pkl, "wb") as f:
+        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[global-covcorr] wrote {out_pkl}")
+
+    # Plots
+    plot_covariance(corr_true, nch_per_erx, "Correlation (global true)",
+                    "channel i", "channel j", "corr(i,j)",
+                    os.path.join(out_dir, "corr_true.pdf"), zrange=(-1., 1.))
+    plot_covariance(corr_pred, nch_per_erx, "Correlation (global prediction)",
+                    "channel i", "channel j", "corr(i,j)",
+                    os.path.join(out_dir, "corr_pred.pdf"), zrange=(-1., 1.))
+    plot_covariance(corr_res, nch_per_erx, "Correlation (global residual)",
+                    "channel i", "channel j", "corr(i,j)",
+                    os.path.join(out_dir, "corr_residual.pdf"), zrange=(-1., 1.))
+
+    plot_covariance(cov_true, nch_per_erx, "Covariance (global true)",
+                    "channel i", "channel j", "cov(i,j)",
+                    os.path.join(out_dir, "cov_true.pdf"), zrange=(-4., 4.))
+    plot_covariance(cov_pred, nch_per_erx, "Covariance (global prediction)",
+                    "channel i", "channel j", "cov(i,j)",
+                    os.path.join(out_dir, "cov_pred.pdf"), zrange=(-4., 4.))
+    plot_covariance(cov_res, nch_per_erx, "Covariance (global residual)",
+                    "channel i", "channel j", "cov(i,j)",
+                    os.path.join(out_dir, "cov_residual.pdf"), zrange=(-4., 4.))
+
+
+def _build_global_covcorr_for(train_module: str, model_name: str):
+    """
+    For a given train_module/model_name: collect all eval bundles, stack rows as new events,
+    then compute global cov/corr.
+    """
+    bundles = list(_iter_bundles_for(train_module, model_name))
+    if not bundles:
+        print(f"[global-covcorr] SKIP: no bundles for {train_module} / {model_name}")
+        return
+
+    trues, preds, cms = [], [], []
+    nch_per_erx_guess = None
+    per_eval_counts = []
+
+    for emod, bpath, meta in bundles:
+        true_df, pred_df, cm_df, meta_b = _load_frames_from_bundle(bpath)
+        if true_df is None or pred_df is None:
+            print(f"[global-covcorr] WARN: frames missing in {bpath}")
+            continue
+
+        # Keep only channel columns (ch_*)
+        ch_cols = [c for c in true_df.columns if str(c).startswith("ch_")]
+        if ch_cols:
+            true_df = true_df[ch_cols]
+            pred_df = pred_df[ch_cols]
+
+        trues.append(true_df)
+        preds.append(pred_df)
+        cms.append(cm_df if cm_df is not None else pd.DataFrame(index=true_df.index))
+        per_eval_counts.append((emod, len(true_df)))
+
+        if nch_per_erx_guess is None:
+            try:
+                nch_per_erx_guess = int(meta_b.get("nch_per_erx", 37))
+            except Exception:
+                nch_per_erx_guess = 37
+
+    if not trues:
+        print(f"[global-covcorr] SKIP: no readable frames for {train_module} / {model_name}")
+        return
+
+    # Row-wise concat as "new events" and fully reset the index to ensure contiguous event IDs
+    true_global = _align_columns_or_union(trues, kind="TRUE").reset_index(drop=True)
+    pred_global = _align_columns_or_union(preds, kind="PRED").reset_index(drop=True)
+    cm_global   = _align_columns_or_union(cms,   kind="CM").reset_index(drop=True)
+
+    # Safety: ensure row counts match (trim if necessary)
+    nmin = min(len(true_global), len(pred_global), len(cm_global) if len(cm_global) else len(true_global))
+    if not (len(true_global) == len(pred_global) == nmin):
+        print(f"[global-covcorr] WARN: row mismatch after concat; trimming to {nmin}")
+        true_global = true_global.iloc[:nmin].reset_index(drop=True)
+        pred_global = pred_global.iloc[:nmin].reset_index(drop=True)
+        if len(cm_global):
+            cm_global   = cm_global.iloc[:nmin].reset_index(drop=True)
+
+    residual_global = true_global - pred_global
+
+    # Informative logging
+    print(f"[global-covcorr] Modules in '{train_module}':")
+    for em, n in per_eval_counts:
+        print(f"  - {em}: {n} events")
+    print(f"[global-covcorr] Global concatenated shape for {train_module}/{model_name}: "
+          f"{len(true_global)} events, {true_global.shape[1]} channels")
+
+    # Include CM columns when building matrices for cov/corr
+    df_true_for_cov = add_cms_to_measurements_df(true_global, cm_global, drop_constant_cm=False)
+    df_pred_for_cov = add_cms_to_measurements_df(pred_global, cm_global, drop_constant_cm=False)
+    df_res_for_cov  = add_cms_to_measurements_df(residual_global, cm_global, drop_constant_cm=False)
+
+    cov_true, corr_true = compute_cov_corr(df_true_for_cov)
+    cov_pred, corr_pred = compute_cov_corr(df_pred_for_cov)
+    cov_res,  corr_res  = compute_cov_corr(df_res_for_cov)
+
+    out_dir = os.path.join(GLOBAL_COVCORR_ROOT, _sanitize(train_module), _sanitize(model_name))
+    _save_global_bundle_and_plots(
+        out_dir, train_module, model_name,
+        cov_true, corr_true, cov_pred, corr_pred, cov_res, corr_res,
+        true_global, pred_global, residual_global, cm_global,
+        nch_per_erx_guess or 37,
+    )
+
+
+def run_global_covcorr():
+    """
+    Iterate train modules (only to discover which models exist),
+    then for each (train_module, model_name) read bundles from plots/performance/<EVAL>/<TRAIN>/<MODEL>.
+    """
+    if not ENABLE_GLOBAL_COVCORR:
+        print("[global-covcorr] Skipped (ENABLE_GLOBAL_COVCORR=False).")
+        return
+
+    os.makedirs(GLOBAL_COVCORR_ROOT, exist_ok=True)
+
+    username_load_model_from = "areimers"
+    dnn_models_base = f"/eos/user/{username_load_model_from[0]}/{username_load_model_from}/hgcal/dnn_models"
+
+    for train_module in sorted(os.listdir(dnn_models_base)):
+        train_dir = os.path.join(dnn_models_base, train_module)
+        if not os.path.isdir(train_dir):
+            continue
+
+        model_names = sorted([
+            d for d in os.listdir(train_dir)
+            if os.path.isdir(os.path.join(train_dir, d))
+        ])
+        if not model_names:
+            continue
+
+        # Filter on dropout/architecture as requested
+        filtered = []
+        for mname in model_names:
+            nodes_per_layer, dr = parse_model_config(mname)
+            if GLOBAL_COVCORR_REQUIRE_DR0 and (dr is None or abs(dr - 0) > 1e-12):
+                continue
+            if ARCH_FILTER and (nodes_per_layer != ARCH_FILTER):
+                continue
+            filtered.append(mname)
+
+        if not filtered:
+            print(f"[global-covcorr] NOTE: no valid models under {train_module}")
+            continue
+
+        selected = filtered if GLOBAL_COVCORR_ALL_DR0_MODELS else filtered[:1]
+        for model_name in selected:
+            print(f"[global-covcorr] Building global cov/corr for {train_module} / {model_name}")
+            _build_global_covcorr_for(train_module, model_name)
+
+# ===================== /Global Cov/Cor block =====================
 
 
 def _arch_ok(layer_tuple):
@@ -298,7 +600,8 @@ def parse_model_config(model_name):
     nodes = re.search(r"__(\d+(?:-\d+)+)__", model_name)
     if not nodes:
         return None, None
-    nodes_per_layer = [int(n) for n in nodes.group(1).split("-")]
+    # Tuple döndür (list yerine)
+    nodes_per_layer = tuple(int(n) for n in nodes.group(1).split("-"))
     dr = re.search(r"__dr([0-9.]+)", model_name)
     if not dr:
         return None, None
@@ -555,7 +858,6 @@ def evaluate_model_and_compute_metrics(modulename_for_evaluation: str, train_mod
         print(corr_res.iloc[0:3, 0:3].round(4))
         """
         # Compute metrics also when reading from bundle
-        import numpy as np
         true_np = np.asarray(meas_true, dtype=float)
         res_np  = np.asarray(residual_meas, dtype=float)
 
@@ -683,19 +985,18 @@ def evaluate_model_and_compute_metrics(modulename_for_evaluation: str, train_mod
     cov_true, corr_true = compute_cov_corr(df_to_compute_cov_true)
     cov_pred, corr_pred = compute_cov_corr(df_to_compute_cov_pred)
     cov_res,  corr_res  = compute_cov_corr(df_to_compute_cov_residuals)
-    """
-    print(f"[DEBUG CODE2] TRUE cov shape={cov_true.shape}, corr shape={corr_true.shape}")
+    print(f"[DEBUG KOD2] TRUE cov shape={cov_true.shape}, corr shape={corr_true.shape}")
     print(cov_true.iloc[:3, :3].round(4))
     print(corr_true.iloc[:3, :3].round(4))
 
-    print(f"[DEBUG CODE2] DNN cov shape={cov_pred.shape}, corr shape={corr_pred.shape}")
+    print(f"[DEBUG KOD2] DNN cov shape={cov_pred.shape}, corr shape={corr_pred.shape}")
     print(cov_pred.iloc[:3, :3].round(4))
     print(corr_pred.iloc[:3, :3].round(4))
 
-    print(f"[DEBUG CODE2] RESIDUAL cov shape={cov_res.shape}, corr shape={corr_res.shape}")
+    print(f"[DEBUG KOD2] RESIDUAL cov shape={cov_res.shape}, corr shape={corr_res.shape}")
     print(cov_res.iloc[:3, :3].round(4))
     print(corr_res.iloc[:3, :3].round(4))
-    """
+
     # --- Pickle bundle: save all computed data into a single file ---
     # --- Save bundle only if allowed ---
     bundle_path = os.path.join(plotfolder, "predictions_bundle.pkl.gz")
@@ -1559,7 +1860,6 @@ def overlay_profiles_multi(xs_list, ys_list, labels_profiles, label_x, label_y, 
     Each series can have its own X and Y.
     Legend is placed outside the plot area.
     """
-    import numpy as np, matplotlib.pyplot as plt, os
 
     # Safety checks
     if not (len(xs_list) == len(ys_list) == len(labels_profiles)):
@@ -2023,3 +2323,6 @@ if __name__ == '__main__':
     # --- Final info about CM plotting ---
     if not GENERATE_CM_PLOTS:
         print("[info] CM/cov-corr plotting disabled globally (GENERATE_CM_PLOTS=False)")
+
+
+    run_global_covcorr()
