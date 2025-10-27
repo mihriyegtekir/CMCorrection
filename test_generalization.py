@@ -18,6 +18,13 @@ from datetime import datetime
 from typing import Optional
 import glob
 from typing import Dict, Tuple, Set
+import evaluate_performance as ep
+import inspect
+import dcor  # distance correlation library
+import shutil
+import pyarrow
+
+# Warning: Enabling the configs below (True) while keeping the database-creation configs above disabled (False) can cause the code to error out — necessary update will be applied.
 
 # ===== Config =====
 ENABLE_RESULTS_TXT_SKIP = True
@@ -46,7 +53,7 @@ MODULES_FOR_GLOBAL_CM_PROFILES = [
 ]  # Only these modules will be processed
 
 # === Noise Fractions Config ===
-ENABLE_NOISE_FRACTIONS_PLOT = True         # Enable/disable coherent/incoherent noise plots
+ENABLE_NOISE_FRACTIONS_PLOT = False         # Enable/disable coherent/incoherent noise plots
 NOISE_FRACTIONS_MODULES = ["ML_F3W_WXIH0197"]               # [] → all eval modules, or specify list of module names
 
 # ===================== Global Cov/Cor (concatenate across eval modules) =====================
@@ -59,6 +66,1464 @@ GLOBAL_COVCORR_REQUIRE_DR0 = True
 GLOBAL_COVCORR_ALL_DR0_MODELS = True
 
 # -------------------------------------------------------------------------------------------
+# ===== Analytic bundle config =====
+ANALYTIC_ENABLE = False                 # set to False to disable analytic bundle generation
+ANALYTIC_OVERWRITE = False             # if an analytic_bundle already exists, skip; if True, overwrite it
+ANALYTIC_OUTPUT_SUBDIR = "analytic"    # name of the output subdirectory
+ANALYTIC_K_LIST = (0,)     # same logic as evaluate_performance.predict_k()
+
+# Which models/eval modules to process
+ANALYTIC_FILTER = {
+    "eval_modules": ["ML_F3W_WXIH0190", "ML_F3W_WXIH0191", "ML_F3W_WXIH0192", "ML_F3W_WXIH0193", "ML_F3W_WXIH0194", "ML_F3W_WXIH0196", "ML_F3W_WXIH0197", "ML_F3W_WXIH0198"],     # [] or None -> include all eval modules
+    "dropout_allowed": [0, 0.0],                # [] or None -> include all dropout rates
+    "nodes_per_layer": [(512, 512, 512, 512, 64)],  # [] or None -> include all architectures
+    # optional: restrict by specific training tags
+    "train_include_regex": None,             # e.g., r"ML_.*0190.*"
+    "train_exclude_regex": None,
+}
+
+# ===== Analytic noise fractions (from analytic_bundle) =====
+ANALYTIC_NOISE_PLOTS_ENABLE = False          # master switch to run analytic noise plots
+ANALYTIC_NOISE_PLOTS_MODULES = [            # [] -> all eval modules; or restrict by names
+    "ML_F3W_WXIH0190", "ML_F3W_WXIH0191", "ML_F3W_WXIH0192",
+    "ML_F3W_WXIH0193", "ML_F3W_WXIH0194", "ML_F3W_WXIH0196",
+    "ML_F3W_WXIH0197", "ML_F3W_WXIH0198",
+]
+ANALYTIC_NOISE_PLOTS_K_LIST = None
+
+# ===================== Analytic Global Cov/Cor (mirror of DNN path) =====================
+
+ENABLE_ANALYTIC_GLOBAL_COVCORR = False
+# Reuse GLOBAL_COVCORR_ROOT from DNN path:
+# GLOBAL_COVCORR_ROOT = os.path.join("plots", "performance", "compare_channels", "global_cov_corr")
+
+ANALYTIC_GLOBAL_COVCORR_REQUIRE_DR0 = True
+ANALYTIC_GLOBAL_COVCORR_ALL_DR0_MODELS = True  # if False, ta8"] #only the first matching model per train_module
+
+# === Projection hists (from evaluate_performance.py) ===
+ENABLE_PROJECTION_HISTS = False
+PROJECTION_EVAL_MODULES = ["ML_F3W_WXIH0190", "ML_F3W_WXIH0198"]  # [] -> all modules
+PROJECTION_MODEL_REGEX = r"__dr0(\.0)?$"
+PROJECTION_TOPK_LIST = [3]   # multiple k values can be executed in one run
+SKIP_EXISTING_PROJECTIONS = True  # skip if projection folders already exist
+
+# === Distance corr (from evaluate_performance.py) ===
+ENABLE_DISTCORR_PLOTS = False
+SKIP_EXISTING_DISTCORR = True
+DISTCORR_EVAL_MODULES = ["ML_F3W_WXIH0190", "ML_F3W_WXIH0198"]  # [] -> all modules
+DISTCORR_MODEL_REGEX = None
+
+DISTCORR_FILTER = {
+    "nodes_per_layer": [(512, 512, 512, 512, 64)],  # [] or None -> all architectures
+    "dropout_allowed": [0, 0.0],                    # [] or None -> all dropout rates
+}
+
+# ===================== Multiple-Input DNN Train (from global_bundle) =====================
+ENABLE_MULTIPLE_INPUT_EXPORT = False
+MULTI_INPUT_TAG = "multiple input dnn train"
+
+# Source directories (where global_bundle.pkl.gz files are stored)
+MULTI_INPUT_BUNDLE_ROOT = os.path.join("plots", "performance", "compare_channels", "global_cov_corr")
+
+# Which train_module / model combinations to process
+MULTI_INPUT_TRAIN_MODULES = [
+    "ML_F3W_WXIH0190_ML_F3W_WXIH0191", "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192", "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192_ML_F3W_WXIH0193",
+]
+MULTI_INPUT_MODELS = [
+    "in20__512-512-512-512-64__dr0",
+]
+# ===================== Multiple-Input DNN Inference (from exported inputs) =====================
+ENABLE_MULTI_INPUT_DNN_INFERENCE = False
+
+# Each entry selects a (train_module, model_name) pair whose inputs live under .../inputs
+MULTI_DNN_RUNS = [
+    {
+        "train_module": "ML_F3W_WXIH0190_ML_F3W_WXIH0191",
+        "model_name":  "in20__512-512-512-512-64__dr0",
+    },
+    {
+        "train_module": "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192_ML_F3W_WXIH0193",
+        "model_name":  "in20__512-512-512-512-64__dr0",
+    },
+    {
+     	"train_module": "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192",
+        "model_name":  "in20__512-512-512-512-64__dr0",
+    },
+
+
+]
+
+# Select multiple by index, e.g. [0], [1], [0,1]
+ACTIVE_MULTI_DNN_RUNS: List[int] = [0, 1, 2]
+
+
+
+# Main output root directory
+MULTI_INPUT_OUTPUT_ROOT = os.path.join("plots", "performance", "multiple_module_input")
+
+# ==================== MULTIPLE MODULE INPUT CREATION RUNNER =====================
+
+ENABLE_MULTI_INPUT_FROM_SINGLE_MODULES = False
+
+# Source folders: only read from here
+SINGLE_MODULE_INPUT_BASE = "/eos/user/a/areimers/hgcal/dnn_inputs"
+
+# Destination folder: write combined outputs here
+MULTI_INPUT_OUTPUT_ROOT = "plots/performance/multiple_module"
+
+# Define which module combinations you want to merge
+MULTI_INPUT_RUNS = [
+    {
+        "modules": ["ML_F3W_WXIH0190", "ML_F3W_WXIH0191"],
+        "train_module_name": "ML_F3W_WXIH0190_ML_F3W_WXIH0191",
+        "model_name": "in20__512-512-512-512-64__dr0",
+    },
+    {
+        "modules": ["ML_F3W_WXIH0190", "ML_F3W_WXIH0191", "ML_F3W_WXIH0192"],
+        "train_module_name": "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192",
+        "model_name": "in20__512-512-512-512-64__dr0",
+    },
+    # --- 4-module combination ---
+    {
+        "modules": ["ML_F3W_WXIH0190", "ML_F3W_WXIH0191", "ML_F3W_WXIH0192", "ML_F3W_WXIH0193"],
+        "train_module_name": "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192_ML_F3W_WXIH0193",
+        "model_name": "in20__512-512-512-512-64__dr0",
+    },
+]
+
+# Which indices from MULTI_INPUT_RUNS to execute
+# (0=2 modules, 1=3 modules, 2=4 modules)
+ACTIVE_MULTI_INPUT_RUNS_FOR_BUILD = [0, 1, 2]
+
+# === Multiple-Input DNN post-processing (bundle + plots) ===
+# Write a predictions bundle under the multiple-module tree (dnn/predictions_bundle.pkl.gz)
+ENABLE_MULTI_DNN_BUNDLE = False
+
+# Immediately generate plots after inference, using the bundle saved under dnn/
+ENABLE_MULTI_DNN_PROJECTION = False     # projection histograms (nonlinearity test)
+ENABLE_MULTI_DNN_DISTCORR  = False     # distance correlation plots
+
+# Projection settings
+MULTI_DNN_PROJ_TOPK_LIST = [2]         # generate modes up to k for each value here
+SKIP_EXISTING_MULTI_PROJ = True        # skip if the projection folder already has results
+
+# Distance-corr settings
+SKIP_EXISTING_MULTI_DIST = True        # skip if the distance folder already has results
+
+
+# ================== Analytic Results for Multiple Modules( Projection - Distance corr Cov ===========
+# --- Configuration for analytic bundle plotting ---
+ENABLE_ANALYTIC_PROJECTION = False
+ENABLE_ANALYTIC_DISTANCECORR = False
+ENABLE_ANALYTIC_DELTA_DISTCORR = False
+
+# Path to the analytic global bundle (example path)
+analytic_bundle_path = (
+    "plots/performance/compare_channels/global_cov_corr/"
+    "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192_ML_F3W_WXIH0193/in20__512-512-512-512-64__dr0/analytic/global_bundle.pkl.gz"
+)
+
+# Output directory for new analytic plots
+analytic_output_dir = (
+    "plots/performance/multiple_module/"
+    "ML_F3W_WXIH0190_ML_F3W_WXIH0191_ML_F3W_WXIH0192_ML_F3W_WXIH0193/in20__512-512-512-512-64__dr0/analytic"
+)
+
+os.makedirs(analytic_output_dir, exist_ok=True)
+
+
+# ============================================================
+# === CONDITIONAL ANALYTIC BUNDLE LOADING ====================
+# ============================================================
+
+if ENABLE_ANALYTIC_PROJECTION or ENABLE_ANALYTIC_DISTANCECORR or ENABLE_ANALYTIC_DELTA_DISTCORR:
+    print(f"[analytic] Loading analytic bundle → {analytic_bundle_path}")
+    with gzip.open(analytic_bundle_path, "rb") as f:
+        bundle = pickle.load(f)
+
+    frames = bundle.get("frames", {})
+    true_df = frames.get("true")
+    pred_df = frames.get("pred")
+    resid_df = frames.get("residual")
+    cm_df = frames.get("cm")
+
+    # --- Verify all required frames are available ---
+    if true_df is None or pred_df is None or resid_df is None or cm_df is None:
+        raise RuntimeError("[analytic] ERROR: Missing one or more frames in analytic bundle")
+
+    print(f"[analytic] Bundle frames loaded:")
+    print(f"  true_df:    shape={true_df.shape}")
+    print(f"  pred_df:    shape={pred_df.shape}")
+    print(f"  residual:   shape={resid_df.shape}")
+    print(f"  cm_df:      shape={cm_df.shape}")
+
+    # --- Build variants and residuals dictionaries for plotting ---
+    variants = {"true": true_df, "analytic": pred_df}
+    residuals = {"analytic": resid_df}
+
+    # --- Create analytic output directories ---
+    proj_dir = os.path.join(analytic_output_dir, "projection")
+    distcorr_dir = os.path.join(analytic_output_dir, "distance_corr")
+    delta_dir = os.path.join(analytic_output_dir, "delta_distance_corr")
+    os.makedirs(proj_dir, exist_ok=True)
+    os.makedirs(distcorr_dir, exist_ok=True)
+    os.makedirs(delta_dir, exist_ok=True)
+else:
+    print("[analytic] Skipping analytic bundle load (no analytic plots enabled).")
+    variants, residuals, cm_df = None, None, None
+
+# ============================================================
+# === 1. Projection Plots ====================================
+# ============================================================
+if ENABLE_ANALYTIC_PROJECTION:
+    print(f"[analytic] Generating projection plots → {proj_dir}")
+    try:
+        ep.plot_all_projection_hists(
+            split_name="analytic",
+            variants=variants,        # CM-free DataFrames
+            residuals=residuals,      # CM-free residuals
+            cm_df=cm_df,              # measured CM data
+            k=2,                      # top eigenmodes
+            plot_dir=proj_dir
+        )
+        print("[analytic] Projection plots created successfully.")
+    except Exception as e:
+        print(f"[analytic] WARNING: Projection plot generation failed → {e}")
+
+# ============================================================
+# === 2. Distance Corr/Cov + Delta Corr ======================
+# ============================================================
+if ENABLE_ANALYTIC_DISTANCECORR:
+    print(f"[analytic] Generating distance correlation heatmaps → {distcorr_dir}")
+
+    try:
+        # Combine CM columns for proper distance correlation calculation
+        variants_with_cms = {
+            k: ep.add_cms_to_measurements_df(measurements_df=v, cm_df=cm_df, drop_constant_cm=False)
+            for k, v in variants.items()
+        }
+        residuals_with_cms = {
+            k: ep.add_cms_to_measurements_df(measurements_df=v, cm_df=cm_df, drop_constant_cm=False)
+            for k, v in residuals.items()
+        }
+
+        # Dummy minimal config
+        class DummyCfg:
+            nch_per_erx = 37
+        cfg = DummyCfg()
+
+        # Standard distance corr/cov plots
+        ep.plot_dist_corr(
+            split_name="analytic",
+            cfg=cfg,
+            variants=variants_with_cms,
+            residuals=residuals_with_cms,
+            cm_df=cm_df,
+            plot_dir=distcorr_dir
+        )
+
+        # Delta-linearized distance corr plots
+        if ENABLE_ANALYTIC_DELTA_DISTCORR:
+            print(f"[analytic] Generating delta distance-corr plots → {delta_dir}")
+            ep.plot_delta_lin_dist_corr(
+                split_name="analytic",
+                cfg=cfg,
+                variants=variants_with_cms,
+                residuals=residuals_with_cms,
+                cm_df=cm_df,
+                plot_dir=delta_dir
+            )
+
+        print("[analytic] Distance correlation + delta plots created successfully.")
+    except Exception as e:
+        print(f"[analytic] WARNING: Distance correlation plot generation failed → {e}")
+
+print(f"[analytic] All analytic plots saved to: {analytic_output_dir}")
+
+#===================================================================================
+
+def _p(mod_dir, *xs):
+    """Helper to join path parts."""
+    return os.path.join(mod_dir, *xs)
+
+
+def _load_single_module_flat_arrays(mod_dir: str):
+    """Load all arrays from one module directory."""
+    colnames = []
+    try:
+        with open(_p(mod_dir, "colnames.json"), "r") as f:
+            colnames = json.load(f)
+    except Exception as e:
+        print(f"[WARN] {mod_dir}: colnames.json could not be read ({e}). Skipped.")
+
+    # Case A: module already has flattened arrays
+    if all(os.path.exists(_p(mod_dir, x)) for x in ["inputs.npy", "targets.npy", "eventid.npy", "chadc.npy"]):
+        X = np.load(_p(mod_dir, "inputs.npy"))
+        y = np.load(_p(mod_dir, "targets.npy")).squeeze()
+        eid = np.load(_p(mod_dir, "eventid.npy")).astype(int).squeeze()
+        ch = np.load(_p(mod_dir, "chadc.npy")).astype(int).squeeze()
+        return X, y, eid, ch, colnames
+
+    # Case B: module has separate train/val files
+    needed = [
+        "inputs_train.npy", "inputs_val.npy",
+        "targets_train.npy", "targets_val.npy",
+        "indices_train.npy", "indices_val.npy",
+        "eventid.npy", "chadc.npy"
+    ]
+    if all(os.path.exists(_p(mod_dir, x)) for x in needed):
+        X_tr = np.load(_p(mod_dir, "inputs_train.npy"))
+        X_va = np.load(_p(mod_dir, "inputs_val.npy"))
+        y_tr = np.load(_p(mod_dir, "targets_train.npy")).squeeze()
+        y_va = np.load(_p(mod_dir, "targets_val.npy")).squeeze()
+        idx_tr = np.load(_p(mod_dir, "indices_train.npy")).astype(int).squeeze()
+        idx_va = np.load(_p(mod_dir, "indices_val.npy")).astype(int).squeeze()
+        eid_full = np.load(_p(mod_dir, "eventid.npy")).astype(int).squeeze()
+        ch_full = np.load(_p(mod_dir, "chadc.npy")).astype(int).squeeze()
+
+        # reconstruct full flattened arrays
+        X = np.concatenate([X_tr, X_va], axis=0)
+        y = np.concatenate([y_tr, y_va], axis=0)
+        eid = np.concatenate([eid_full[idx_tr], eid_full[idx_va]], axis=0)
+        ch = np.concatenate([ch_full[idx_tr], ch_full[idx_va]], axis=0)
+        return X, y, eid, ch, colnames
+
+    raise FileNotFoundError(f"Missing required files in {mod_dir}.")
+
+
+def _check_colnames_consistency(colnames_all: list[list[str]]) -> list[str]:
+    """Choose the longest available column list as reference."""
+    non_empty = [c for c in colnames_all if c]
+    if not non_empty:
+        return []
+    ref = max(non_empty, key=len)
+    ref_len = len(ref)
+    mism = [(i, len(c)) for i, c in enumerate(colnames_all) if c and c != ref]
+    if mism:
+        print("⚠ Column name mismatch detected.")
+        for i, l in mism:
+            print(f"   module index {i}: {l} columns (ref {ref_len})")
+    return ref
+
+
+def _pivot_measurements(values, channels, eventid) -> pd.DataFrame:
+    """Build a wide event×channel DataFrame (optional diagnostic)."""
+    df = pd.DataFrame({"value": values, "channel": channels.astype(int), "eventid": eventid.astype(int)})
+    wide = df.pivot(index="eventid", columns="channel", values="value")
+    wide.columns = [f"ch_{c:03d}" for c in wide.columns]
+    wide = wide.sort_index().reindex(columns=sorted(wide.columns))
+    return wide
+
+
+def run_build_multi_inputs_from_modules():
+    """Main function: merge inputs from multiple modules into one dataset."""
+    if not ENABLE_MULTI_INPUT_FROM_SINGLE_MODULES:
+        print("[multi-input-build] Disabled.")
+        return
+
+    for run_idx in ACTIVE_MULTI_INPUT_RUNS_FOR_BUILD:
+        if run_idx < 0 or run_idx >= len(MULTI_INPUT_RUNS):
+            print(f"[multi-input-build] Invalid index: {run_idx}")
+            continue
+
+        cfg = MULTI_INPUT_RUNS[run_idx]
+        modules = cfg["modules"]
+        train_module_name = cfg["train_module_name"]
+        model_name = cfg["model_name"]
+
+        out_dir = os.path.join(MULTI_INPUT_OUTPUT_ROOT, train_module_name, model_name, "dnn", "inputs")
+        os.makedirs(out_dir, exist_ok=True)
+
+        print(f"\n[multi-input-build] run={run_idx}")
+        print(f"  modules: {modules}")
+        print(f"  output : {out_dir}")
+
+        inputs_list, targets_list, eid_list, ch_list, colnames_list = [], [], [], [], []
+        next_eid_offset = 0
+
+        for m in modules:
+            mod_dir = os.path.join(SINGLE_MODULE_INPUT_BASE, m)
+            if not os.path.isdir(mod_dir):
+                print(f"[multi-input-build] Missing: {mod_dir}")
+                continue
+
+            try:
+                X, y, eid, ch, colnames = _load_single_module_flat_arrays(mod_dir)
+            except Exception as e:
+                print(f"[multi-input-build] Error reading {m}: {e}")
+                continue
+
+            if not (X.shape[0] == y.shape[0] == eid.shape[0] == ch.shape[0]):
+                raise RuntimeError(f"[{m}] inconsistent row counts.")
+
+            # apply eventid offset to keep them unique across modules
+            eid_shifted = eid + next_eid_offset
+            next_eid_offset = int(eid_shifted.max()) + 1
+
+            inputs_list.append(X)
+            targets_list.append(y)
+            eid_list.append(eid_shifted)
+            ch_list.append(ch)
+            colnames_list.append(list(colnames) if colnames else [])
+
+        if not inputs_list:
+            print("[multi-input-build] No modules loaded, skipped.")
+            continue
+
+        colnames = _check_colnames_consistency(colnames_list)
+
+        inputs_merged = np.concatenate(inputs_list, axis=0)
+        targets_merged = np.concatenate(targets_list, axis=0)
+        eventid_merged = np.concatenate(eid_list, axis=0)
+        chadc_merged = np.concatenate(ch_list, axis=0)
+
+        print(f"  merged: inputs={inputs_merged.shape}, targets={targets_merged.shape}")
+
+        np.save(os.path.join(out_dir, "inputs_flat.npy"), inputs_merged)
+        np.save(os.path.join(out_dir, "targets_flat.npy"), targets_merged)
+        np.save(os.path.join(out_dir, "eventid.npy"), eventid_merged.astype(np.int64))
+        np.save(os.path.join(out_dir, "chadc.npy"), chadc_merged.astype(np.int32))
+        with open(os.path.join(out_dir, "colnames.json"), "w") as f:
+            json.dump(colnames, f, indent=2)
+
+        try:
+            meas_df = _pivot_measurements(targets_merged, chadc_merged, eventid_merged)
+            meas_df.to_parquet(os.path.join(out_dir, "measurements.parquet"))
+        except Exception as e:
+            print(f"  measurement parquet not written: {e}")
+
+        with open(os.path.join(out_dir, "log.txt"), "w") as f:
+            f.write("===== Multi-Input Merge =====\n")
+            f.write(f"Timestamp     : {datetime.utcnow().isoformat()}Z\n")
+            f.write(f"Modules       : {modules}\n")
+            f.write(f"Train module  : {train_module_name}\n")
+            f.write(f"Model name    : {model_name}\n")
+            f.write(f"Inputs shape  : {inputs_merged.shape}\n")
+            f.write(f"Targets shape : {targets_merged.shape}\n")
+            f.write(f"Unique events : {len(np.unique(eventid_merged))}\n")
+
+        print(f"  written to: {out_dir}")
+        print(f"[multi-input-build] done: {train_module_name} | {model_name}")
+# ===================== /Multiple-Input: build inputs from single-module dirs =====================
+
+
+
+# ===================== DNN RUNNER for MULTIPLE MODULES=============================
+def run_multi_input_dnn_inference(username_load_model_from: str = "areimers"):
+
+    if not ENABLE_MULTI_INPUT_DNN_INFERENCE:
+        print("[multi-dnn] Skipped (ENABLE_MULTI_INPUT_DNN_INFERENCE=False).")
+        return
+
+    # where inputs/ and outputs/ live (your area)
+    base_io_root = MULTI_INPUT_OUTPUT_ROOT  # "plots/performance/multiple_module_input"
+    # where models live (Andreas' area)
+    dnn_models_base = f"/eos/user/{username_load_model_from[0]}/{username_load_model_from}/hgcal/dnn_models"
+
+    for idx in ACTIVE_MULTI_DNN_RUNS:
+        if idx < 0 or idx >= len(MULTI_DNN_RUNS):
+            print(f"[multi-dnn] Invalid index in ACTIVE_MULTI_DNN_RUNS: {idx} (skip)")
+            continue
+
+        cfg = MULTI_DNN_RUNS[idx]
+        train_module = cfg["train_module"]
+        model_name   = cfg["model_name"]
+
+        # ---- build paths ----
+        in_dir  = os.path.join(base_io_root, _sanitize(train_module), _sanitize(model_name), "dnn", "inputs")
+        out_dir = os.path.join(base_io_root, _sanitize(train_module), _sanitize(model_name), "dnn", "outputs")
+        os.makedirs(out_dir, exist_ok=True)
+
+        model_path = os.path.join(
+            dnn_models_base, train_module, model_name, "regression_dnn_best.pth"
+        )
+
+        print(f"\n[multi-dnn] Run index={idx}")
+        print(f"  inputs   : {in_dir}")
+        print(f"  model    : {model_path}")
+        print(f"  outputs  : {out_dir}")
+
+        # ---- load inputs ----
+        try:
+            inputs_flat = np.load(os.path.join(in_dir, "inputs_flat.npy"))
+            targets_flat = np.load(os.path.join(in_dir, "targets_flat.npy"))
+            eventid_flat = np.load(os.path.join(in_dir, "eventid.npy"))
+            chadc_flat   = np.load(os.path.join(in_dir, "chadc.npy"))
+            meas_df      = pd.read_parquet(os.path.join(in_dir, "measurements.parquet"))
+        except Exception as e:
+            print(f"[multi-dnn] ERROR loading inputs from {in_dir}: {e}")
+            continue
+
+        # ---- instantiate model skeleton (use nodes & dropout parsed from model_name) ----
+        nodes_per_layer, dropout_rate = parse_model_config(model_name)
+        if nodes_per_layer is None or dropout_rate is None:
+            print(f"[multi-dnn] Cannot parse model_name: {model_name} (skip)")
+            continue
+
+        input_dim = int(inputs_flat.shape[1])
+        device = torch.device("cpu")
+
+        net = models.DNNFlex(
+            input_dim=input_dim,
+            nodes_per_layer=nodes_per_layer,
+            dropout_rate=dropout_rate,
+            tag=""
+        ).to(device).eval()
+
+        if not os.path.exists(model_path):
+            print(f"[multi-dnn] MISSING weights: {model_path} (skip)")
+            continue
+
+        # ---- load weights & run inference ----
+        try:
+            state = torch.load(model_path, map_location=device)
+            net.load_state_dict(state)
+            # ---- safe inference in chunks to avoid OOM ----
+            DNN_INFER_CHUNK_SIZE = 1_000_000  # number of samples per chunk
+
+            preds_list = []
+            n_samples = inputs_flat.shape[0]
+            with torch.no_grad():
+                for start in range(0, n_samples, DNN_INFER_CHUNK_SIZE):
+                    end = min(start + DNN_INFER_CHUNK_SIZE, n_samples)
+                    X_chunk = torch.from_numpy(inputs_flat[start:end]).float().to(device)
+                    y_chunk = net(X_chunk).squeeze().cpu().numpy()
+                    preds_list.append(y_chunk)
+                    print(f"[multi-dnn] processed {end}/{n_samples} samples")
+
+            y_pred = np.concatenate(preds_list, axis=0)
+
+        except Exception as e:
+            print(f"[multi-dnn] ERROR during inference: {e}")
+            continue
+
+        # ---- validate sizes & save flat preds ----
+        if y_pred.shape[0] != targets_flat.shape[0]:
+            raise RuntimeError(
+                f"[multi-dnn] Size mismatch: preds={y_pred.shape[0]}, targets={targets_flat.shape[0]}"
+            )
+
+        flat_out = os.path.join(out_dir, "preds_flat.npy")
+        np.save(flat_out, y_pred)
+        print(f"[multi-dnn] Saved flat predictions → {flat_out}")
+
+        # ---- pivot to (event x channel) using evaluate_performance helper ----
+        try:
+            preds_df = ep.pivot_flat_preds_to_event_channel(
+                preds_flat=y_pred,
+                eventid_flat=eventid_flat,
+                channels_flat=chadc_flat,
+                reference_meas_df=meas_df,   # keeps exact event set/column order
+            )
+        except Exception as e:
+            print(f"[multi-dnn] ERROR pivoting predictions: {e}")
+            continue
+
+        df_out = os.path.join(out_dir, "preds_df.parquet")
+        preds_df.to_parquet(df_out)
+        print(f"[multi-dnn] Saved pivoted predictions → {df_out}")
+
+        # ===============================================================
+        # Add compatibility block for evaluate_performance layout
+        # ===============================================================
+        # Standard path: plots/performance/<EVAL>/<TRAIN>/<MODEL>/
+        std_dir = os.path.join(
+            "plots", "performance",
+            _sanitize(train_module),   # <EVAL>
+            _sanitize(train_module),   # <TRAIN>
+            _sanitize(model_name)      # <MODEL>
+        )
+        os.makedirs(std_dir, exist_ok=True)
+
+        # 1) Save minimal artifacts for evaluate_performance compatibility
+        np.save(os.path.join(std_dir, "predictions_flat.npy"), y_pred)
+        preds_df.to_parquet(os.path.join(std_dir, "predictions_df.parquet"))
+        try:
+            meas_df.to_parquet(os.path.join(std_dir, "measurements.parquet"))
+        except Exception as e:
+            print(f"[multi-dnn/std] WARN: could not write measurements.parquet ({e})")
+
+        try:
+            shutil.copy(os.path.join(in_dir, "eventid.npy"), os.path.join(std_dir, "eventid.npy"))
+            shutil.copy(os.path.join(in_dir, "chadc.npy"),   os.path.join(std_dir, "chadc.npy"))
+        except Exception as e:
+            print(f"[multi-dnn/std] WARN: could not copy id arrays ({e})")
+
+        # 2) Rebuild CM dataframe from inputs + colnames
+        try:
+            with open(os.path.join(in_dir, "colnames.json")) as f:
+                colnames_inputs = json.load(f)
+        except Exception:
+            colnames_inputs = [f"cm_erx{i:02d}" for i in range(min(12, inputs_flat.shape[1]))]
+
+        ncm = len([c for c in colnames_inputs if str(c).startswith("cm_erx")])
+        try:
+            _inputs_df, cm_df = _build_input_and_cm_df(
+                inputs_flat=inputs_flat,
+                eventid_flat=eventid_flat,
+                ncm=ncm,
+                colnames_inputs=colnames_inputs
+            )
+            cm_df.to_parquet(os.path.join(std_dir, "cm.parquet"))
+        except Exception as e:
+            print(f"[multi-dnn/std] WARN: could not reconstruct cm_df ({e})")
+            cm_df = pd.DataFrame(index=meas_df.index)
+
+        # 3) Compute residuals and cov/corr with CM columns included
+        residual_df = meas_df - preds_df
+        df_true_for_cov = add_cms_to_measurements_df(measurements_df=meas_df,  cm_df=cm_df, drop_constant_cm=False)
+        df_pred_for_cov = add_cms_to_measurements_df(measurements_df=preds_df, cm_df=cm_df, drop_constant_cm=False)
+        df_res_for_cov  = add_cms_to_measurements_df(measurements_df=residual_df, cm_df=cm_df, drop_constant_cm=False)
+
+        cov_true, corr_true = compute_cov_corr(df_true_for_cov)
+        cov_pred, corr_pred = compute_cov_corr(df_pred_for_cov)
+        cov_res,  corr_res  = compute_cov_corr(df_res_for_cov)
+
+        nch_per_erx = 37
+        nerx = max(1, preds_df.shape[1] // nch_per_erx)
+
+        # 4) Save a complete predictions bundle at standard path
+        save_predictions_bundle(
+            plotfolder=std_dir,
+            eval_module=train_module,
+            train_module=train_module,
+            model_name=model_name,
+            nodes_per_layer=list(nodes_per_layer),
+            dropout_rate=float(dropout_rate),
+            ncmchannels=int(ncm),
+            nch_per_erx=int(nch_per_erx),
+            nerx=int(nerx),
+            eventid_combined=eventid_flat,
+            chadc_combined=chadc_flat,
+            colnames_inputs=colnames_inputs,
+            meas_true_df=meas_df,
+            meas_pred_df=preds_df,
+            cm_df=cm_df,
+            residual_df=residual_df,
+            cov_true=cov_true,  corr_true=corr_true,
+            cov_pred=cov_pred,  corr_pred=corr_pred,
+            cov_res=cov_res,    corr_res=corr_res,
+        )
+
+        print(f"[multi-dnn] Also saved standard files and bundle → {std_dir}")
+        # ===============================================================
+
+        # ---- small log ----
+        with open(os.path.join(out_dir, "log.txt"), "w") as f:
+            f.write("===== Multiple-Input DNN Inference =====\n")
+            f.write(f"Timestamp     : {datetime.utcnow().isoformat()}Z\n")
+            f.write(f"Train module  : {train_module}\n")
+            f.write(f"Model name    : {model_name}\n")
+            f.write(f"Model path    : {model_path}\n")
+            f.write(f"Inputs shape  : {inputs_flat.shape}\n")
+            f.write(f"Targets shape : {targets_flat.shape}\n")
+            f.write(f"Preds shape   : {y_pred.shape}\n")
+            f.write(f"Output folder : {out_dir}\n")
+
+        print(f"[multi-dnn] DONE for {train_module} | {model_name}")
+
+
+def run_multi_dnn_postprocess_only():
+    """
+    Recreate a predictions_bundle.pkl.gz and generate projection + distance plots
+    from existing multiple-module outputs (no inference).
+    """
+    # base path where your multiple-module input/output lives
+    base_io_root = MULTI_INPUT_OUTPUT_ROOT  # "plots/performance/multiple_module"
+
+    for cfg in MULTI_DNN_RUNS:
+        train_module = cfg["train_module"]
+        model_name   = cfg["model_name"]
+
+        print(f"\n[postprocess] Starting bundle + plots for {train_module} | {model_name}")
+
+        dnn_dir = os.path.join(base_io_root, _sanitize(train_module), _sanitize(model_name), "dnn")
+        input_dir  = os.path.join(dnn_dir, "inputs")
+        output_dir = os.path.join(dnn_dir, "outputs")
+
+        # --- expected files ---
+        preds_flat_path = os.path.join(output_dir, "preds_flat.npy")
+        meas_path        = os.path.join(input_dir, "measurements.parquet")
+        eventid_path     = os.path.join(input_dir, "eventid.npy")
+        chadc_path       = os.path.join(input_dir, "chadc.npy")
+
+        if not all(os.path.exists(p) for p in [preds_flat_path, meas_path, eventid_path, chadc_path]):
+            print(f"[postprocess] Missing required files in {input_dir} or {output_dir}. Skipping.")
+            continue
+
+        # --- load everything ---
+        preds_flat  = np.load(preds_flat_path)
+        eventid_flat = np.load(eventid_path)
+        chadc_flat   = np.load(chadc_path)
+        meas_df      = pd.read_parquet(meas_path)
+        
+        # --- DEBUG ---
+        #cm_cols_in_meas = [c for c in meas_df.columns if str(c).startswith("cm_erx")]
+        #print("[DEBUG] meas_df cm_erx cols:", cm_cols_in_meas)
+        #print("[DEBUG] meas_df cm_erx count:", len(cm_cols_in_meas))
+
+        # pivot flat preds to (event × channel)
+        preds_df = ep.pivot_flat_preds_to_event_channel(
+            preds_flat=preds_flat,
+            eventid_flat=eventid_flat,
+            channels_flat=chadc_flat,
+            reference_meas_df=meas_df
+        )
+
+        # --- construct bundle path ---
+        bundle_path = os.path.join(dnn_dir, "predictions_bundle.pkl.gz")
+
+        if ENABLE_MULTI_DNN_BUNDLE:
+            print(f"[postprocess] Writing bundle → {bundle_path}")
+
+            # 1) (legacy) Try to get CM from measurements.parquet (only if such columns exist)
+            cm_cols = [c for c in meas_df.columns if str(c).startswith("cm_erx")]
+            if len(cm_cols) > 0:
+                cm_df = meas_df[cm_cols]
+                print(f"[postprocess] CM taken from measurements.parquet with {len(cm_cols)} columns.")
+            else:
+                # 2) Otherwise, rebuild CM from inputs_flat.npy using colnames.json
+                # --- Try to rebuild CM dataframe from inputs_flat.npy ---
+                colnames_path = os.path.join(input_dir, "colnames.json")
+                if os.path.exists(colnames_path):
+                    with open(colnames_path, "r") as f:
+                        colnames_inputs = json.load(f)
+                else:
+                    print(f"[postprocess] WARNING: colnames.json not found in {input_dir}, using empty list")
+                    colnames_inputs = []
+
+                cm_names = [c for c in colnames_inputs if str(c).startswith("cm_erx")]
+                try:
+                    # --- Load inputs and event IDs ---
+                    inputs_arr   = np.load(os.path.join(input_dir, "inputs_flat.npy"), mmap_mode="r")
+                    eventid_flat = np.load(os.path.join(input_dir, "eventid.npy"))
+
+                    # --- Identify one row per event (first occurrence) ---
+                    unique_ids, first_pos = np.unique(eventid_flat, return_index=True)
+                    order = np.argsort(unique_ids)
+                    rows = first_pos[order]
+                    evt_idx = unique_ids[order]
+
+                    # --- Extract CM columns by name ---
+                    if cm_names:
+                        cm_indices = [colnames_inputs.index(name) for name in cm_names]
+                        cm_data = inputs_arr[rows[:, None], cm_indices]
+                        cm_df = pd.DataFrame(cm_data, index=evt_idx, columns=cm_names)
+                        print(f"[postprocess] CM rebuilt from inputs_flat.npy with {len(cm_names)} columns.")
+                    else:
+                        cm_df = pd.DataFrame(index=meas_df.index)
+                        print("[postprocess] No CM columns found in colnames.json; using empty cm_df.")
+
+                    # --- Compute residuals and correlation matrices ---
+                    print("[postprocess] Computing residuals and correlation matrices...")
+                    residual_df = meas_df - preds_df
+
+                    df_true_for_cov = ep.add_cms_to_measurements_df(meas_df, cm_df, drop_constant_cm=False)
+                    df_pred_for_cov = ep.add_cms_to_measurements_df(preds_df, cm_df, drop_constant_cm=False)
+                    df_res_for_cov  = ep.add_cms_to_measurements_df(residual_df, cm_df, drop_constant_cm=False)
+
+                    cov_true, corr_true = ep.compute_cov_corr(df_true_for_cov)
+                    cov_pred, corr_pred = ep.compute_cov_corr(df_pred_for_cov)
+                    cov_res,  corr_res  = ep.compute_cov_corr(df_res_for_cov)
+
+                    # --- Save bundle including CM and residuals ---
+                    save_predictions_bundle(
+                        plotfolder=dnn_dir,
+                        eval_module=train_module,
+                        train_module=train_module,
+                        model_name=model_name,
+                        nodes_per_layer=[512,512,512,512,64],
+                        dropout_rate=0.0,
+                        ncmchannels=len(cm_names),
+                        nch_per_erx=37,
+                        nerx=6,
+                        eventid_combined=eventid_flat,
+                        chadc_combined=chadc_flat,
+                        colnames_inputs=colnames_inputs,
+                        meas_true_df=meas_df,
+                        meas_pred_df=preds_df,
+                        cm_df=cm_df,
+                        residual_df=residual_df,
+                        cov_true=cov_true,  corr_true=corr_true,
+                        cov_pred=cov_pred,  corr_pred=corr_pred,
+                        cov_res=cov_res,    corr_res=corr_res,
+                    )
+
+                except Exception as e:
+                    print(f"[postprocess] WARNING: failed to rebuild CM or save bundle → {e}")
+                    cm_df = pd.DataFrame(index=meas_df.index)
+
+
+
+        # --- generate projection + distance plots from bundle ---
+        if ENABLE_MULTI_DNN_PROJECTION:
+            proj_dir = os.path.join(dnn_dir, "plots", "projection")
+            os.makedirs(proj_dir, exist_ok=True)
+            for k in MULTI_DNN_PROJ_TOPK_LIST:
+                print(f"[postprocess] Projection (k={k}) → {proj_dir}")
+                _run_projection_hists_via_ep(
+                    bundle_path=bundle_path,
+                    out_dir=proj_dir,
+                    title=f"{train_module} | {model_name}",
+                    nbins=60,
+                    k=k
+                )
+
+        if ENABLE_MULTI_DNN_DISTCORR:
+            dist_dir = os.path.join(dnn_dir, "plots", "distance")
+            os.makedirs(dist_dir, exist_ok=True)
+            print(f"[postprocess] Distance corr → {dist_dir}")
+            _run_distcorr_via_ep(
+                bundle_path=bundle_path,
+                out_dir=dist_dir,
+                title=f"{train_module} | {model_name}"
+            )
+
+        print(f"[postprocess] Done for {train_module} | {model_name}")
+
+
+
+def _sanitize(s: str) -> str:
+    """Replace unsafe characters for file paths."""
+    return s.replace("/", "_").replace(" ", "_")
+
+"""
+def _export_from_global_bundle(bundle_path: str, out_dir_inputs: str) -> None:
+    os.makedirs(out_dir_inputs, exist_ok=True)
+
+    # --- open bundle ---
+    with gzip.open(bundle_path, "rb") as f:
+        b = pickle.load(f)
+
+    frames = b.get("frames", {}) or {}
+    true_df: pd.DataFrame = frames.get("true")
+    cm_df:   pd.DataFrame = frames.get("cm")
+
+    if true_df is None or cm_df is None:
+        raise RuntimeError(f"Missing 'true' or 'cm' in bundle: {bundle_path}")
+
+    # --- sort channel columns (ch_000, ch_001, ...) ---
+    ch_cols = [c for c in true_df.columns if str(c).startswith("ch_")]
+    if not ch_cols:
+        raise RuntimeError("No channel columns starting with 'ch_' found in 'true' frame.")
+    ch_cols_sorted = sorted(ch_cols, key=lambda c: int(c.split("_")[1]))
+    true_df = true_df[ch_cols_sorted]
+
+    # --- dimensions ---
+    n_events = len(true_df)
+    n_channels = len(ch_cols_sorted)
+    n_cm = cm_df.shape[1]
+
+    # --- build flattened arrays ---
+    # inputs_flat: repeat CM vector of each event for all channels
+    inputs_flat = np.repeat(cm_df.to_numpy(), n_channels, axis=0)          # (E*C, N_cm)
+    # targets_flat: flatten true values row-wise
+    targets_flat = true_df.to_numpy().ravel(order="C")                     # (E*C,)
+    # eventid and channel arrays
+    event_ids = true_df.index.to_numpy()
+    eventid_flat = np.repeat(event_ids, n_channels)                         # (E*C,)
+    ch_nums = np.array([int(c.split("_")[1]) for c in ch_cols_sorted], dtype=int)
+    chadc_flat = np.tile(ch_nums, n_events)                                 # (E*C,)
+
+    # --- input column names ---
+    if all(str(c).startswith("cm_erx") for c in cm_df.columns):
+        colnames_inputs = list(map(str, cm_df.columns))
+    else:
+        colnames_inputs = [f"cm_{i:02d}" for i in range(n_cm)]
+
+    # --- write outputs ---
+    np.save(os.path.join(out_dir_inputs, "inputs_flat.npy"),   inputs_flat)
+    np.save(os.path.join(out_dir_inputs, "targets_flat.npy"),  targets_flat)
+    np.save(os.path.join(out_dir_inputs, "eventid.npy"),       eventid_flat)
+    np.save(os.path.join(out_dir_inputs, "chadc.npy"),         chadc_flat)
+
+    true_df.to_parquet(os.path.join(out_dir_inputs, "measurements.parquet"))
+    cm_df.to_parquet(os.path.join(out_dir_inputs, "cm.parquet"))
+
+    with open(os.path.join(out_dir_inputs, "colnames.json"), "w") as f:
+        json.dump(colnames_inputs, f)
+
+    # --- summary log ---
+    print(f"[multi-input] {bundle_path}")
+    print(f"  events={n_events}  channels={n_channels}  N_cm={n_cm}")
+    print(f"  → wrote to {out_dir_inputs}")
+
+def run_multiple_input_export():
+    if not ENABLE_MULTIPLE_INPUT_EXPORT:
+        print("[multi-input] Skipped (ENABLE_MULTIPLE_INPUT_EXPORT=False).")
+        return
+
+    total, done = 0, 0
+    for train_module in MULTI_INPUT_TRAIN_MODULES:
+        for model_name in MULTI_INPUT_MODELS:
+            total += 1
+            bundle_dir = os.path.join(MULTI_INPUT_BUNDLE_ROOT, train_module, model_name)
+            bundle_path = os.path.join(bundle_dir, "global_bundle.pkl.gz")
+            if not os.path.exists(bundle_path):
+                print(f"[multi-input] MISSING bundle: {bundle_path}")
+                continue
+
+            # output directory:
+            # plots/performance/multiple_module_input/<TRAIN_MODULE>/<MODEL>/inputs
+            out_dir_inputs = os.path.join(
+                MULTI_INPUT_OUTPUT_ROOT,
+                _sanitize(train_module),
+                _sanitize(model_name),
+                "inputs"
+            )
+            try:
+                _export_from_global_bundle(bundle_path=bundle_path, out_dir_inputs=out_dir_inputs)
+                done += 1
+            except Exception as e:
+                print(f"[multi-input] ERROR for {train_module} / {model_name}: {e}")
+
+    print(f"[multi-input] Finished: {done}/{total} exports.")
+# ===================== /Multiple-Input DNN Train (from global_bundle) =====================
+"""
+
+# ================== Distance Correlation Runner ===================
+
+def _has_valid_results(folder: str) -> bool:
+    """
+    Check if the folder contains valid output files (PDF/PNG).
+    Avoids skipping empty folders.
+    """
+    if not os.path.exists(folder):
+        return False
+    for f in os.listdir(folder):
+        if f.endswith(".pdf") or f.endswith(".png"):
+            return True
+        subpath = os.path.join(folder, f)
+        if os.path.isdir(subpath):
+            # check recursively inside subfolders (e.g., distcorr/, delta_lin_distcorr/)
+            if _has_valid_results(subpath):
+                return True
+    return False
+
+def _run_distcorr_via_ep(bundle_path: str, out_dir: str, title: str = ""):
+    """
+    Load a prediction or analytic bundle and generate distance correlation plots.
+    Reads the pickled bundle, extracts DataFrames, builds a minimal EvalConfig,
+    and calls ep.plot_dist_corr() and ep.plot_delta_lin_dist_corr().
+    """
+    import gzip, pickle, re
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Load bundle file ---
+    with gzip.open(bundle_path, "rb") as f:
+        b = pickle.load(f)
+
+    frames = b.get("frames", {}) or {}
+    true_df = frames.get("true")
+    pred_df = frames.get("pred")
+    resid_df = frames.get("residual")
+    cm_df = frames.get("cm")
+
+    # --- Handle analytic bundles separately ---
+    if "analytic" in bundle_path:
+        if pred_df is None and "analytic" in frames:
+            if isinstance(frames["analytic"], dict) and 0 in frames["analytic"]:
+                pred_df = frames["analytic"][0]
+        if resid_df is None and "residuals" in frames:
+            if isinstance(frames["residuals"], dict) and 0 in frames["residuals"]:
+                resid_df = frames["residuals"][0]
+
+    # --- Sanity checks ---
+    if true_df is None or pred_df is None:
+        raise RuntimeError("Both 'true' and 'pred' frames are required for distance correlation plots.")
+    if cm_df is None or cm_df.empty:
+        raise RuntimeError("'cm_df' is required for distance correlation plots but was not found in the bundle.")
+
+
+    # --- Build a minimal EvalConfig to satisfy ep.plot_dist_corr() ---
+    # Some plotting functions inside evaluate_performance expect cfg.nch_per_erx, cfg.nerx, cfg.ncmchannels, etc.
+    # We create a minimal placeholder config with safe default values.
+    try:
+        module_match = re.search(r"(ML_[A-Z0-9_]+)", bundle_path)
+        eval_mod = module_match.group(1) if module_match else "unknown"
+    except Exception:
+        eval_mod = "unknown"
+
+    cfg = ep.EvalConfig(
+        modulenames_used_for_training=[eval_mod],
+        modulename_for_evaluation=eval_mod,
+        nodes_per_layer=(512, 512, 512, 512, 64),
+        dropout_rate=0.0,
+        modeltag="distance_corr",
+        inputfoldertag="auto",
+        ncmchannels=12,   # number of common-mode channels per erx
+        nch_per_erx=37,   # number of physical channels per erx
+        nerx=6,           # number of erx chips (or sensor partitions)
+    )
+
+    # --- Prepare variants and residuals dictionaries ---
+    variants = {"true": true_df, "dnn": pred_df}
+    residuals = {"dnn": resid_df} if resid_df is not None else {}
+
+    # This ensures that CM channels are included in distance correlation plots,
+    # avoiding axis misalignment and missing CM blocks.
+    variants_with_cms = {
+        k: ep.add_cms_to_measurements_df(
+            measurements_df=v,
+            cm_df=cm_df,
+            drop_constant_cm=False
+        )
+        for k, v in variants.items()
+    }
+
+    residuals_with_cms = {
+        k: ep.add_cms_to_measurements_df(
+            measurements_df=v,
+            cm_df=cm_df,
+            drop_constant_cm=False
+        )
+        for k, v in residuals.items()
+    }
+
+    # --- Generate distance correlation plots ---
+    print(f"[distcorr] Generating plots in {out_dir}")
+
+    ep.plot_dist_corr(
+        split_name="combined",
+        cfg=cfg,
+        variants=variants_with_cms,       # <-- changed here
+        residuals=residuals_with_cms,     # <-- changed here
+        cm_df=cm_df,
+        plot_dir=os.path.join(out_dir, "distcorr"),
+    )
+
+    ep.plot_delta_lin_dist_corr(
+        split_name="combined",
+        cfg=cfg,
+        variants=variants_with_cms,       # <-- changed here
+        residuals=residuals_with_cms,     # <-- changed here
+        cm_df=cm_df,
+        plot_dir=os.path.join(out_dir, "delta_lin_distcorr"),
+    )
+
+
+def run_distance_corr_plots():
+    """
+    Iterate over all bundles and generate distance correlation plots
+    (both DNN and Analytic). Uses skip logic and configurable module filters.
+    """
+    if not ENABLE_DISTCORR_PLOTS:
+        print("[distcorr] Skipped (ENABLE_DISTCORR_PLOTS=False).")
+        return
+
+    import re as _re
+    patt = _re.compile(DISTCORR_MODEL_REGEX) if DISTCORR_MODEL_REGEX else None
+    total, done = 0, 0
+
+    for eval_module, train_module, model_name, bundle_path in _iter_all_bundles(BASE_DIR):
+        nodes, _dr = parse_model_config(model_name)
+
+        # --- Config-based architecture/dropout filtering ---
+        allowed_layers = DISTCORR_FILTER.get("nodes_per_layer", [])
+        if allowed_layers and nodes not in allowed_layers:
+            continue
+
+        allowed_drops = DISTCORR_FILTER.get("dropout_allowed", [])
+        if allowed_drops and _dr not in allowed_drops:
+            continue
+
+        if DISTCORR_EVAL_MODULES and (eval_module not in DISTCORR_EVAL_MODULES):
+            continue
+        if patt and (patt.search(model_name) is None):
+            continue
+
+        total += 1
+        print(f"\n[distcorr] Processing model={model_name} (layers={nodes}, dr={_dr})")
+
+        # -------- DNN --------
+        out_dir_dnn = os.path.join(BASE_DIR, eval_module, train_module, model_name, "distance_corr", "dnn")
+        if SKIP_EXISTING_DISTCORR and _has_valid_results(out_dir_dnn):
+            print(f"[distcorr][DNN] Skipped existing results: {out_dir_dnn}")
+        else:
+            try:
+                _run_distcorr_via_ep(bundle_path=bundle_path, out_dir=out_dir_dnn, title=f"{model_name} [DNN]")
+                print(f"[distcorr][DNN] Done → {out_dir_dnn}")
+                done += 1
+            except Exception as e:
+                print(f"[distcorr][DNN] ERROR ({model_name}): {e}")
+
+        # -------- ANALYTIC --------
+        analytic_bundle = os.path.join(BASE_DIR, eval_module, train_module, model_name, "analytic", "analytic_bundle.pkl.gz")
+        out_dir_analytic = os.path.join(BASE_DIR, eval_module, train_module, model_name, "distance_corr", "analytic")
+
+        if os.path.exists(analytic_bundle):
+            if SKIP_EXISTING_DISTCORR and _has_valid_results(out_dir_analytic):
+                print(f"[distcorr][ANALYTIC] Skipped existing results: {out_dir_analytic}")
+            else:
+                try:
+                    _run_distcorr_via_ep(bundle_path=analytic_bundle, out_dir=out_dir_analytic, title=f"{model_name} [Analytic]")
+                    print(f"[distcorr][ANALYTIC] Done → {out_dir_analytic}")
+                    done += 1
+                except Exception as e:
+                    print(f"[distcorr][ANALYTIC] ERROR ({model_name}): {e}")
+        else:
+            print(f"[distcorr][ANALYTIC] Skipped (no analytic bundle found): {analytic_bundle}")
+
+    print(f"\n[distcorr] Finished: {done}/{total} model bundles processed.")
+
+# ================== Projection Histogram - nonlinearity Test ===========
+def _run_projection_hists_via_ep(
+    bundle_path: str,
+    out_dir: str,
+    title: str = "",
+    nbins: int = 60,
+    k: int = None,
+):
+    """
+    Load a prediction or analytic bundle and generate projection histograms.
+    Accepts a user-defined 'k' value (from PROJECTION_TOPK_LIST).
+    """
+    with gzip.open(bundle_path, "rb") as f:
+        b = pickle.load(f)
+    """
+    # --- DEBUG: inspect bundle content ---
+    print(f"[DEBUG] Inspecting bundle: {bundle_path}")
+    print(b.keys())
+    if "frames" in b:
+        print("Frames keys:", list(b["frames"].keys()))
+    else:
+        print("No 'frames' key in bundle.")
+    # -------------------------------------
+    """
+    frames = b.get("frames", {}) or {}
+    true_df = frames.get("true")
+    pred_df = frames.get("pred")
+    resid_df = frames.get("residual")
+    cm_df = frames.get("cm")
+
+    # --- only apply this logic for ANALYTIC bundles ---
+    if "analytic" in bundle_path:
+        if pred_df is None and "analytic" in frames:
+            if isinstance(frames["analytic"], dict) and 0 in frames["analytic"]:
+                pred_df = frames["analytic"][0]
+                print("[DEBUG] (Analytic) Using frames['analytic'][0] as prediction source.")
+
+        if resid_df is None and "residuals" in frames:
+            if isinstance(frames["residuals"], dict) and 0 in frames["residuals"]:
+                resid_df = frames["residuals"][0]
+                print("[DEBUG] (Analytic) Using frames['residuals'][0] as residual source.")
+
+    if true_df is None or pred_df is None:
+        raise RuntimeError("Both 'true' and 'pred' frames are required for projection.")
+    ch_cols = [c for c in true_df.columns if str(c).startswith("ch_")]
+    if not ch_cols:
+        raise RuntimeError("No ch_* columns found for projection.")
+    if len(true_df) != len(pred_df):
+        nmin = min(len(true_df), len(pred_df))
+        true_df = true_df.iloc[:nmin].reset_index(drop=True)
+        pred_df = pred_df.iloc[:nmin].reset_index(drop=True)
+        if resid_df is not None:
+            resid_df = resid_df.iloc[:nmin].reset_index(drop=True)
+
+    if cm_df is None or cm_df.empty:
+        raise RuntimeError("The 'cm_df' is required for projection but was not found in the bundle.")
+
+    variants = {"true": true_df, "dnn": pred_df}
+    residuals = {}
+    if resid_df is not None:
+        residuals["dnn"] = resid_df
+
+    # Detect valid arguments from ep.plot_all_projection_hists
+    sig = inspect.signature(ep.plot_all_projection_hists)
+    params = set(sig.parameters.keys())
+
+    kwargs = {}
+    if "variants" in params:
+        kwargs["variants"] = variants
+    if "residuals" in params:
+        kwargs["residuals"] = residuals
+    if "split_name" in params:
+        kwargs["split_name"] = "combined"
+    if "cm_df" in params:
+        kwargs["cm_df"] = cm_df
+    if "plot_dir" in params:
+        kwargs["plot_dir"] = out_dir
+    if "k" in params and k is not None:
+        # plot_all_projection_hists draws modes 0..k-1
+        # calling with k+1 ensures mode k is included
+        kwargs["k"] = k + 1
+
+    print(f"[projection] Generating projections up to mode {k} in {out_dir}")
+
+
+    # Directly generate all projection histograms into a single folder
+    os.makedirs(out_dir, exist_ok=True)
+    ep.plot_all_projection_hists(**kwargs)
+
+    print(f"[projection] Completed: all modes up to {k} stored in {out_dir}")
+
+
+    print(f"[projection] Calling plot_all_projection_hists with k={k}")
+    return ep.plot_all_projection_hists(**kwargs)
+
+
+def run_projection_hists():
+    """
+    Iterate over existing DNN and Analytic bundles and generate projection histograms
+    for multiple k values. Skip existing results if enabled.
+    """
+    if not ENABLE_PROJECTION_HISTS:
+        print("[projection] Skipped (ENABLE_PROJECTION_HISTS=False).")
+        return
+
+    import re as _re
+    patt = _re.compile(PROJECTION_MODEL_REGEX) if PROJECTION_MODEL_REGEX else None
+    total, done = 0, 0
+
+    for eval_module, train_module, model_name, bundle_path in _iter_all_bundles(BASE_DIR):
+        nodes, _dr = parse_model_config(model_name)
+        if ARCH_FILTER and (nodes != ARCH_FILTER):
+            continue
+        if PROJECTION_EVAL_MODULES and (eval_module not in PROJECTION_EVAL_MODULES):
+            continue
+        if patt and (patt.search(model_name) is None):
+            continue
+
+        total += 1
+
+        # Path to potential analytic bundle
+        analytic_bundle = os.path.join(
+            BASE_DIR, eval_module, train_module, model_name, "analytic", "analytic_bundle.pkl.gz"
+        )
+
+        # Loop over all selected k values
+        for k_value in PROJECTION_TOPK_LIST:
+            print(f"\n[projection] Processing model={model_name}, k={k_value}")
+
+            # ======== DNN ========
+            out_dir_dnn = os.path.join(
+                BASE_DIR, eval_module, train_module, model_name, "projections"
+            )
+
+            if SKIP_EXISTING_PROJECTIONS and os.path.exists(out_dir_dnn) and os.listdir(out_dir_dnn):
+                print(f"[projection][DNN] Skipped existing results for k={k_value}: {out_dir_dnn}")
+            else:
+                os.makedirs(out_dir_dnn, exist_ok=True)
+                try:
+                    print(f"[projection][DNN] Generating histograms for k={k_value}")
+                    _run_projection_hists_via_ep(
+                        bundle_path=bundle_path,
+                        out_dir=out_dir_dnn,
+                        title=f"{eval_module} | {train_module} | {model_name} [DNN k={k_value}]",
+                        nbins=60,
+                        k=k_value,
+                    )
+                    print(f"[projection][DNN] Wrote histograms to: {out_dir_dnn}")
+                    done += 1
+                except Exception as e:
+                    print(f"[projection][DNN] ERROR ({eval_module}, {train_module}, {model_name}, k={k_value}): {e}")
+
+            # ======== ANALYTIC ========
+            if os.path.exists(analytic_bundle):
+                out_dir_analytic = os.path.join(
+                    BASE_DIR, eval_module, train_module, model_name, "analytic", "projections"
+                )
+
+                if SKIP_EXISTING_PROJECTIONS and os.path.exists(out_dir_analytic) and os.listdir(out_dir_analytic):
+                    print(f"[projection][ANALYTIC] Skipped existing results for k={k_value}: {out_dir_analytic}")
+                else:
+                    os.makedirs(out_dir_analytic, exist_ok=True)
+                    try:
+                        print(f"[projection][ANALYTIC] Generating histograms for k={k_value}")
+                        _run_projection_hists_via_ep(
+                            bundle_path=analytic_bundle,
+                            out_dir=out_dir_analytic,
+                            title=f"{eval_module} | {train_module} | {model_name} [Analytic k={k_value}]",
+                            nbins=60,
+                            k=k_value,
+                        )
+                        print(f"[projection][ANALYTIC] Wrote histograms to: {out_dir_analytic}")
+                        done += 1
+                    except Exception as e:
+                        print(f"[projection][ANALYTIC] ERROR ({eval_module}, {train_module}, {model_name}, k={k_value}): {e}")
+            else:
+                print(f"[projection][ANALYTIC] Skipped (no analytic bundle found): {analytic_bundle}")
+
+    print(f"\n[projection] Finished: {done}/{total} model bundles processed.")
+
+
+# =================== /Projection histograms runner =====================
+
+
+
+def _iter_analytic_bundles_for(train_module: str, model_name: str):
+    """
+    Yield (eval_module, bundle_path) for analytic bundles under:
+      plots/performance/<EVAL>/<TRAIN>/<MODEL>/analytic/analytic_bundle.pkl.gz
+    Eval list is parsed from train_module exactly like DNN path.
+    """
+    eval_modules = _get_eval_modules_from_train_module(train_module)
+    if not eval_modules:
+        print(f"[agcc-simple] WARN: no evals parsed from '{train_module}'")
+        return
+    for emod in eval_modules:
+        p = os.path.join(
+            BASE_DIR, emod, train_module, model_name, "analytic", "analytic_bundle.pkl.gz"
+        )
+        if os.path.exists(p):
+            yield emod, p
+        else:
+            print(f"[agcc-simple] MISSING: {p}")
+
+def _load_frames_from_analytic_bundle(bundle_path: str, k: int = 0):
+    """
+    Return (true_df, pred_df, cm_df, meta) from an analytic bundle.
+    Use frames['analytic'][k] if present; otherwise reconstruct pred = true - residuals[k].
+    """
+    with gzip.open(bundle_path, "rb") as f:
+        b = pickle.load(f)
+    frames = b.get("frames", {}) or {}
+    meta   = b.get("meta",   {}) or {}
+
+    true_df = frames.get("true")
+    cm_df   = frames.get("cm")
+    anal    = frames.get("analytic", {}) or {}
+    resid   = frames.get("residuals", {}) or {}
+    if true_df is None:
+        raise RuntimeError(f"'true' frame missing in {bundle_path}")
+    if k in anal:
+        pred_df = anal[k]
+    elif k in resid:
+        pred_df = true_df - resid[k]
+    else:
+        raise RuntimeError(f"Neither analytic[k={k}] nor residuals[k={k}] in {bundle_path}")
+    return true_df, pred_df, cm_df, meta
+
+def _build_global_covcorr_analytic(train_module: str, model_name: str, k: int = 0):
+    """
+    Mirror of _build_global_covcorr_for but reading analytic bundles and
+    writing outputs under .../<train_module>/<model_name>/analytic/.
+    Uses the same _save_global_bundle_and_plots() helper for identical outputs.
+    """
+    bundles = list(_iter_analytic_bundles_for(train_module, model_name))
+    if not bundles:
+        print(f"[agcc-simple] SKIP: no analytic bundles for {train_module} / {model_name}")
+        return
+
+    trues, preds, cms = [], [], []
+    nch_per_erx_guess = None
+    per_eval_counts = []
+
+    for emod, bpath in bundles:
+        try:
+            true_df, pred_df, cm_df, meta_b = _load_frames_from_analytic_bundle(bpath, k=k)
+        except Exception as e:
+            print(f"[agcc-simple] WARN: cannot open {bpath}: {e}")
+            continue
+
+        # Keep only channel columns (ch_*)
+        ch_cols = [c for c in true_df.columns if str(c).startswith("ch_")]
+        if ch_cols:
+            true_df = true_df[ch_cols]
+            pred_df = pred_df[ch_cols]
+
+        trues.append(true_df)
+        preds.append(pred_df)
+        cms.append(cm_df if cm_df is not None else pd.DataFrame(index=true_df.index))
+        per_eval_counts.append((emod, len(true_df)))
+
+        if nch_per_erx_guess is None:
+            try:
+                nch_per_erx_guess = int(meta_b.get("nch_per_erx", 37))
+            except Exception:
+                nch_per_erx_guess = 37
+
+    if not trues:
+        print(f"[agcc-simple] SKIP: no readable frames for {train_module} / {model_name}")
+        return
+
+    # Concatenate rows (events) across eval modules; union columns if needed
+    true_global = _align_columns_or_union(trues, kind="TRUE").reset_index(drop=True)
+    pred_global = _align_columns_or_union(preds, kind="PRED").reset_index(drop=True)
+    cm_global   = _align_columns_or_union(cms,   kind="CM").reset_index(drop=True)
+
+    # Trim to common length if needed
+    nmin = min(len(true_global), len(pred_global), len(cm_global) if len(cm_global) else len(true_global))
+    if not (len(true_global) == len(pred_global) == nmin):
+        print(f"[agcc-simple] WARN: row mismatch after concat; trimming to {nmin}")
+        true_global = true_global.iloc[:nmin].reset_index(drop=True)
+        pred_global = pred_global.iloc[:nmin].reset_index(drop=True)
+        if len(cm_global):
+            cm_global   = cm_global.iloc[:nmin].reset_index(drop=True)
+
+    residual_global = true_global - pred_global
+
+    # Info
+    print(f"[agcc-simple] Modules in '{train_module}':")
+    for em, n in per_eval_counts:
+        print(f"  - {em}: {n} events")
+    print(f"[agcc-simple] Global concatenated shape for {train_module}/{model_name}: "
+          f"{len(true_global)} events, {true_global.shape[1]} channels")
+
+    # Compute cov/corr with CM columns included (no dropping constant CM; same as DNN global)
+    df_true = add_cms_to_measurements_df(true_global, cm_global, drop_constant_cm=False)
+    df_pred = add_cms_to_measurements_df(pred_global, cm_global, drop_constant_cm=False)
+    df_res  = add_cms_to_measurements_df(residual_global, cm_global, drop_constant_cm=False)
+
+    cov_true, corr_true = compute_cov_corr(df_true)
+    cov_pred, corr_pred = compute_cov_corr(df_pred)
+    cov_res,  corr_res  = compute_cov_corr(df_res)
+
+    # Output dir: identical tree as DNN + 'analytic' leaf
+    out_dir = os.path.join(GLOBAL_COVCORR_ROOT, _sanitize(train_module), _sanitize(model_name), "analytic")
+    _save_global_bundle_and_plots(
+        out_dir, train_module, model_name,
+        cov_true, corr_true, cov_pred, corr_pred, cov_res, corr_res,
+        true_global, pred_global, residual_global, cm_global,
+        nch_per_erx_guess or 37,
+    )
+    # Note: uses same filenames as DNN (e.g., global_bundle.pkl.gz, corr_true.pdf, ...)
+
+def run_analytic_global_covcorr():
+    """
+    Mirror of run_global_covcorr for analytic inputs.
+    - Discovers train_modules and models under dnn_models_base
+    - Filters by dr0 and ARCH (same as DNN)
+    - For each selected model, builds analytic global cov/corr (k=0)
+    """
+    if not ENABLE_ANALYTIC_GLOBAL_COVCORR:
+        print("[agcc-simple] Skipped (ENABLE_ANALYTIC_GLOBAL_COVCORR=False).")
+        return
+
+    username_load_model_from = "areimers"
+    dnn_models_base = f"/eos/user/{username_load_model_from[0]}/{username_load_model_from}/hgcal/dnn_models"
+
+    for train_module in sorted(os.listdir(dnn_models_base)):
+        train_dir = os.path.join(dnn_models_base, train_module)
+        if not os.path.isdir(train_dir):
+            continue
+
+        model_names = sorted([
+            d for d in os.listdir(train_dir)
+            if os.path.isdir(os.path.join(train_dir, d))
+        ])
+        if not model_names:
+            continue
+
+        # Filter on dropout/architecture (same as DNN path)
+        filtered = []
+        for mname in model_names:
+            nodes_per_layer, dr = parse_model_config(mname)
+            if ANALYTIC_GLOBAL_COVCORR_REQUIRE_DR0 and (dr is None or abs(dr - 0) > 1e-12):
+                continue
+            if ARCH_FILTER and (nodes_per_layer != ARCH_FILTER):
+                continue
+            filtered.append(mname)
+
+        if not filtered:
+            print(f"[agcc-simple] NOTE: no valid models under {train_module}")
+            continue
+
+        selected = filtered if ANALYTIC_GLOBAL_COVCORR_ALL_DR0_MODELS else filtered[:1]
+        for model_name in selected:
+            print(f"[agcc-simple] Building analytic global cov/corr for {train_module} / {model_name}")
+            _build_global_covcorr_analytic(train_module, model_name, k=0)
+# ================= END of ANALYTIC GLOBAL CORR COV ======================================
 
 def _get_eval_modules_from_train_module(train_module: str) -> list:
     """
@@ -154,6 +1619,61 @@ def _align_columns_or_union(dfs: list, kind: str) -> pd.DataFrame:
     print(f"[global-covcorr] INFO: {kind} columns differ; using union of {len(union_cols)} cols.")
     dfs_re = [df.reindex(columns=union_cols) for df in dfs]
     return pd.concat(dfs_re, axis=0, ignore_index=True)
+
+
+class _SimpleSplit:
+    """Minimal split object with only what build_variants() needs."""
+    def __init__(self, measurements_df: pd.DataFrame, cm_df: pd.DataFrame, event_ids: np.ndarray):
+        self.measurements_df = measurements_df
+        self.cm_df = cm_df
+        self.event_ids = event_ids
+
+def _build_train_pool_split(modnames: List[str], base_cfg: ep.EvalConfig) -> _SimpleSplit:
+    """
+    Build the *fit* domain from multiple training modules by row-wise concatenation.
+    Columns are aligned by UNION (missing columns are filled with NaN).
+    Event IDs are re-numbered to be contiguous from 0..N-1.
+    """
+    meas_list, cm_list, eid_list = [], [], []
+
+    for m in modnames:
+        # clone base config but point evaluation module to current train module 'm'
+        cfg_i = ep.EvalConfig(
+            modulenames_used_for_training=base_cfg.modulenames_used_for_training,
+            modulename_for_evaluation=m,                 # <--- this is the *source* of rows
+            nodes_per_layer=base_cfg.nodes_per_layer,
+            dropout_rate=base_cfg.dropout_rate,
+            modeltag=base_cfg.modeltag,
+            inputfoldertag=base_cfg.inputfoldertag,
+            ncmchannels=base_cfg.ncmchannels,
+            nch_per_erx=base_cfg.nch_per_erx,
+            nerx=base_cfg.nerx,
+        )
+        io_i = ep.DataIO(cfg=cfg_i)
+        io_i.load_all()
+        s_i = io_i.get_split("combined")  # same split semantics you already use
+
+        meas_list.append(s_i.measurements_df)
+        cm_list.append(s_i.cm_df)
+        eid_list.append(np.asarray(s_i.event_ids, dtype=int))
+
+    if not meas_list:
+        raise RuntimeError("No training modules found to pool for analytic fit.")
+
+    # union columns across modules, then row-wise concat (events stacked one under another)
+    meas_pool = _align_columns_or_union(meas_list, kind="MEAS_POOL")
+    cm_pool   = _align_columns_or_union(cm_list,   kind="CM_POOL")
+
+    # rebuild contiguous event ids for the pooled table
+    nrows = len(meas_pool)
+    eids  = np.arange(nrows, dtype=int)
+
+    # safety: keep only ch_* in measurements (same convention as elsewhere)
+    ch_cols = [c for c in meas_pool.columns if str(c).startswith("ch_")]
+    if ch_cols:
+        meas_pool = meas_pool[ch_cols]
+
+    return _SimpleSplit(measurements_df=meas_pool, cm_df=cm_pool, event_ids=eids)
 
 
 def _save_global_bundle_and_plots(
@@ -457,7 +1977,7 @@ def _pivot_measurements(values: np.ndarray, channels: np.ndarray, eventid: np.nd
     wide = df.pivot(index="eventid", columns="channel", values="value")
     wide.columns = [f"ch_{c:03d}" for c in wide.columns]
     return wide.sort_index().reindex(columns=sorted(wide.columns))
-
+"""
 def _build_input_and_cm_df(inputs_flat: np.ndarray, eventid_flat: np.ndarray, ncm: int, colnames_inputs: List[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     if inputs_flat.shape[1] < ncm:
         raise ValueError(f"Requested ncm={ncm} but inputs have only {inputs_flat.shape[1]} columns")
@@ -478,6 +1998,459 @@ def _build_input_and_cm_df(inputs_flat: np.ndarray, eventid_flat: np.ndarray, nc
     cm_df = inputs_df[cm_cols]
 
     return (inputs_df, cm_df)
+"""
+def _build_input_and_cm_df(inputs_flat: np.ndarray,
+                           eventid_flat: np.ndarray,
+                           ncm: int,
+                           colnames_inputs: List[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build the full input and CM DataFrames from the flattened arrays.
+    If a mismatch occurs between inputs_flat and colnames_inputs (e.g., 20 vs 16 features),
+    automatically attempt to recover colnames.json from the next module (e.g., 0191).
+    """
+    if inputs_flat.shape[1] < ncm:
+        raise ValueError(f"Requested ncm={ncm} but inputs have only {inputs_flat.shape[1]} columns")
+
+    # --- Identify unique event IDs and sorting order ---
+    unique_ids, first_pos = np.unique(eventid_flat, return_index=True)
+    order = np.argsort(unique_ids)
+    event_ids_sorted = unique_ids[order]
+    rows = first_pos[order]
+
+    # --- Try to build the DataFrame normally ---
+    try:
+        inputs_df = pd.DataFrame(inputs_flat[rows, :], index=event_ids_sorted, columns=colnames_inputs)
+
+    except ValueError as e:
+        print(f"[WARNING] Feature mismatch detected while building inputs DataFrame.")
+        print(f"  → inputs_flat columns = {inputs_flat.shape[1]}")
+        print(f"  → colnames.json length = {len(colnames_inputs)}")
+
+        # --- Try recovery from the next module directory ---
+        # Determine current working input directory if available
+        import inspect, os, json
+        caller_frame = inspect.stack()[1]
+        local_vars = caller_frame.frame.f_locals
+        input_dir = local_vars.get("input_dir", None)
+
+        recovered = False
+        if input_dir is not None and "ML_F3W_WXIH" in input_dir:
+            parts = input_dir.split(os.sep)
+            try:
+                module_combo = parts[-4]   # e.g. ML_F3W_WXIH0190_ML_F3W_WXIH0191
+                model_name = parts[-3]     # e.g. in20__512-512-512-512-64__dr0
+                parent_dir = os.path.join(*parts[:-4])
+            except IndexError:
+                module_combo, model_name, parent_dir = None, None, None
+
+            if module_combo and model_name:
+                modules = module_combo.split("_")
+                # find current module (e.g., ML_F3W_WXIH0190)
+                for idx, mod in enumerate(modules):
+                    if "ML_F3W_WXIH" in mod and idx + 1 < len(modules):
+                        next_module = modules[idx + 1]
+                        next_combo = "_".join(modules[idx:idx+2])
+                        next_input_dir = os.path.join(parent_dir, next_combo, model_name, "dnn", "inputs")
+                        next_json = os.path.join(next_input_dir, "colnames.json")
+
+                        if os.path.exists(next_json):
+                            with open(next_json, "r") as f:
+                                next_cols = json.load(f)
+                            if len(next_cols) == inputs_flat.shape[1]:
+                                print(f"[RECOVER] Using colnames.json from next module: {next_module}")
+                                colnames_inputs = next_cols
+                                recovered = True
+                                break
+                            else:
+                                print(f"[RECOVER] Fallback colnames.json found in {next_module} "
+                                      f"but still mismatched (len={len(next_cols)}).")
+
+        if not recovered:
+            print("[RECOVER] Could not recover from next module. Truncating to smaller column count.")
+            min_cols = min(inputs_flat.shape[1], len(colnames_inputs))
+            inputs_flat = inputs_flat[:, :min_cols]
+            colnames_inputs = colnames_inputs[:min_cols]
+
+        # Rebuild DataFrame after recovery attempt
+        inputs_df = pd.DataFrame(inputs_flat[rows, :], index=event_ids_sorted, columns=colnames_inputs)
+        print(f"[RECOVER] inputs_df successfully rebuilt after mismatch.")
+
+    # --- Extract CM columns and verify count ---
+    cm_cols = [c for c in colnames_inputs if c.startswith("cm_erx")]
+    if len(cm_cols) != ncm:
+        raise ValueError(
+            f"Found {len(cm_cols)} CM columns by name ({cm_cols[:5]}...), "
+            f"but cfg.ncmchannels={ncm}."
+        )
+
+    cm_df = inputs_df[cm_cols]
+    return (inputs_df, cm_df)
+
+
+# ===========ANALYTIC CALCULATIONS ===================
+
+def _analytic_bundle_path(eval_module: str, train_module: str, model_name: str) -> str:
+    # create the full directory path for the analytic bundle under the performance folder
+    root = os.path.join("plots", "performance", eval_module, train_module, model_name, ANALYTIC_OUTPUT_SUBDIR)
+    os.makedirs(root, exist_ok=True)  # ensure that the directory exists
+    return os.path.join(root, "analytic_bundle.pkl.gz")  # return the full path to the bundle file
+
+
+def save_analytic_bundle(
+    *,
+    eval_module: str,
+    train_module: str,
+    model_name: str,
+    nodes_per_layer: Tuple[int, ...],
+    dropout_rate: float,
+    cfg: ep.EvalConfig,
+    split: ep.SplitData,
+    variants: Dict[str, pd.DataFrame],
+    variants_with_cms: Dict[str, pd.DataFrame],
+    residuals: Dict[str, pd.DataFrame],
+    residuals_with_cms: Dict[str, pd.DataFrame],
+    k_list: Tuple[int, ...],
+) -> str:
+    """
+    Combine analytic predictions + residuals + covariance/correlation matrices for each k into a single package.
+    """
+    covcorr = {}
+    for key in variants_with_cms.keys():
+        cov, corr = ep.compute_cov_corr(variants_with_cms[key])
+        covcorr.setdefault("pred", {})[key] = {"cov": cov, "corr": corr}
+    for key in residuals_with_cms.keys():
+        cov, corr = ep.compute_cov_corr(residuals_with_cms[key])
+        covcorr.setdefault("residual", {})[key] = {"cov": cov, "corr": corr}
+
+    bundle = {
+        "version": 1,
+        "created_utc": datetime.utcnow().isoformat() + "Z",
+        "meta": {
+            "type": "analytic",
+            "eval_module": eval_module,
+            "train_module": train_module,
+            "model_name": model_name,
+            "nodes_per_layer": list(nodes_per_layer),
+            "dropout_rate": float(dropout_rate),
+            "ncmchannels": int(cfg.ncmchannels),
+            "nch_per_erx": int(cfg.nch_per_erx),
+            "nerx": int(cfg.nerx),
+            "k_list": list(k_list),
+            "source": "evaluate_performance.py",
+            "fit_pool_modules": list(getattr(cfg, "modulenames_used_for_training", [])),
+        },
+
+        "indices": {
+            "event_ids": split.event_ids,
+            "channel_names": list(split.measurements_df.columns),
+            "cm_colnames": list(split.cm_df.columns),
+        },
+        "frames": {
+            "true": split.measurements_df,
+            "cm": split.cm_df,
+            "analytic": {k: variants[f"analytic_k{k}"] for k in k_list if f"analytic_k{k}" in variants},
+            "residuals": {k: residuals[f"analytic_k{k}"] for k in k_list if f"analytic_k{k}" in residuals},
+        },
+        "covcorr": covcorr,
+    }
+
+    out_path = _analytic_bundle_path(eval_module, train_module, model_name)
+    with gzip.open(out_path, "wb") as f:
+        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[analytic] wrote {out_path}")
+    return out_path
+
+def _parse_allowed(model_name: str) -> Tuple[Optional[Tuple[int, ...]], Optional[float]]:
+    nodes, dr = parse_model_config(model_name)
+    return nodes, dr
+
+
+def _analytic_should_run_for(eval_module: str, train_module: str, model_name: str) -> bool:
+    import re as _re
+    filt = ANALYTIC_FILTER
+    nodes, dr = _parse_allowed(model_name)
+
+    # dropout filter
+    if filt.get("dropout_allowed"):
+        if dr is None or (dr not in filt["dropout_allowed"]):
+            return False
+
+    # nodes_per_layer filter
+    if filt.get("nodes_per_layer"):
+        if (nodes is None) or (tuple(nodes) not in [tuple(t) for t in filt["nodes_per_layer"]]):
+            return False
+
+    # eval filter
+    if filt.get("eval_modules"):
+        if eval_module not in filt["eval_modules"]:
+            return False
+
+    # train include/exclude regex
+    inc = filt.get("train_include_regex")
+    exc = filt.get("train_exclude_regex")
+    if inc and not _re.search(inc, train_module):
+        return False
+    if exc and _re.search(exc, train_module):
+        return False
+
+    return True
+
+
+def build_and_save_analytic_bundle(
+    *,
+    eval_module: str,
+    train_module: str,
+    model_name: str,
+    username_load_model_from: str
+) -> Optional[str]:
+    """
+    Use DataIO + AnalyticInferencer from evaluate_performance.py
+    to compute analytic predictions and save the results as analytic_bundle.pkl.gz.
+    """
+    out_path = _analytic_bundle_path(eval_module, train_module, model_name)
+    if (not ANALYTIC_OVERWRITE) and os.path.exists(out_path):
+        print(f"[analytic] exists, skipping: {out_path}")
+        return out_path
+
+    nodes, dr = _parse_allowed(model_name)
+    if nodes is None or dr is None:
+        print(f"[analytic] skip (cannot parse model name): {model_name}")
+        return None
+
+    # 1) evaluate_performance configuration
+    cfg = ep.EvalConfig(
+        modulenames_used_for_training=_get_eval_modules_from_train_module(train_module),
+        modulename_for_evaluation=eval_module,
+        nodes_per_layer=list(nodes),
+        dropout_rate=float(dr),
+        modeltag="",
+        inputfoldertag="",
+        ncmchannels=12,
+    )
+    io = ep.DataIO(cfg=cfg)
+    io.load_all()
+
+    # --- CHANGED: split_predict = EVAL domain, split_correction = TRAIN-POOL domain ---
+    split_eval = io.get_split("combined")                     # where we will PREDICT & PLOT
+    split_fit  = _build_train_pool_split(                     # where we will FIT analytic params
+        modnames=cfg.modulenames_used_for_training,
+        base_cfg=cfg
+    )
+
+
+    analytic = ep.AnalyticInferencer(drop_constant_cm=True)
+
+    # 'model_folder' is irrelevant for analytic; keep dummy
+    dummy_model_folder = "."
+
+    variants, variants_with_cms = ep.build_variants(
+        split_predict=split_eval,
+        split_correction=split_fit,
+        cfg=cfg,
+        model_folder=dummy_model_folder,
+        dnn_inferencer=None,
+        analytic_inferencer=analytic,
+        k_list=ANALYTIC_K_LIST
+    )
+    residuals, residuals_with_cms = ep.make_residuals(variants, cm_df=split_eval.cm_df)
+
+
+    # 3) save bundle
+    return save_analytic_bundle(
+        eval_module=eval_module,
+        train_module=train_module,
+        model_name=model_name,
+        nodes_per_layer=tuple(nodes),
+        dropout_rate=float(dr),
+        cfg=cfg,
+        split=split_eval,
+        variants=variants,
+        variants_with_cms=variants_with_cms,
+        residuals=residuals,
+        residuals_with_cms=residuals_with_cms,
+        k_list=ANALYTIC_K_LIST,
+    )
+def run_analytic_jobs(username_load_model_from: str):
+    if not ANALYTIC_ENABLE:
+        print("[analytic] disabled (ANALYTIC_ENABLE=False)")
+        return
+
+    modules, models_map = discover_modules_and_models(username_load_model_from)
+
+    # If the eval list in the filter is empty, loop through all input modules
+    target_eval_modules = ANALYTIC_FILTER.get("eval_modules") or modules
+
+    total, done = 0, 0
+    for train_module, model_list in sorted(models_map.items()):
+        for model_name in sorted(model_list):
+            # Only run for the eval modules specified in the filter
+            for eval_module in target_eval_modules:
+                if not _analytic_should_run_for(eval_module, train_module, model_name):
+                    continue
+                total += 1
+                print(f"[analytic] running for EVAL={eval_module}  TRAIN={train_module}  MODEL={model_name}")
+                try:
+                    path = build_and_save_analytic_bundle(
+                        eval_module=eval_module,
+                        train_module=train_module,
+                        model_name=model_name,
+                        username_load_model_from=username_load_model_from
+                    )
+                    if path:
+                        done += 1
+                except Exception as e:
+                    print(f"[analytic] ERROR for ({eval_module}, {train_module}, {model_name}): {e}")
+
+    print(f"[analytic] finished: {done}/{total} bundles created.")
+
+
+#Analytic noise ratio
+
+def _iter_all_analytic_bundles(base="plots/performance"):
+    """
+    Yield (eval_module, train_module, model_name, bundle_path) for all analytic bundles.
+    Pattern:
+      plots/performance/<EVAL>/<TRAIN>/<MODEL>/analytic/analytic_bundle.pkl.gz
+    """
+    pattern = os.path.join(base, "*", "*", "*", ANALYTIC_OUTPUT_SUBDIR, "analytic_bundle.pkl.gz")
+    for p in glob.glob(pattern):
+        parts = p.split(os.sep)
+        # .../plots/performance/<EVAL>/<TRAIN>/<MODEL>/analytic/analytic_bundle.pkl.gz
+        eval_module, train_module, model_name = parts[-5], parts[-4], parts[-3]
+        yield eval_module, train_module, model_name, p
+
+
+def _make_noise_plot_from_analytic_bundle(bundle_path: str, k: int) -> None:
+    """
+    Read analytic_bundle.pkl.gz and make the coherent/incoherent noise figure
+    using plot_coherent_noise(), saving as:
+      noise_fractions_with_ratio__analytic_k{K}.pdf
+    in the same analytic/ directory as the bundle.
+    """
+    with gzip.open(bundle_path, "rb") as f:
+        b = pickle.load(f)
+
+    meta    = b.get("meta", {})
+    frames  = b.get("frames", {})
+    if not meta or not frames:
+        print(f"[analytic-noise] Missing meta/frames in {bundle_path}")
+        return
+
+    true_df = frames.get("true")
+    cm_df   = frames.get("cm")
+    anal_map = frames.get("analytic", {}) or {}
+    res_map  = frames.get("residuals", {}) or {}
+
+    if true_df is None:
+        print(f"[analytic-noise] 'true' frame is missing in {bundle_path}")
+        return
+
+    # Use analytic prediction if present; otherwise reconstruct from residuals (pred = true - residual)
+    if k in anal_map:
+        pred_df = anal_map[k]
+    elif k in res_map:
+        pred_df = true_df - res_map[k]
+    else:
+        print(f"[analytic-noise] Neither analytic[k={k}] nor residuals[k={k}] present in {bundle_path}")
+        return
+
+    # Keep only channel columns in numeric order (ch_000, ch_001, ...)
+    ch_cols = [c for c in true_df.columns if str(c).startswith("ch_")]
+    ch_cols_sorted = sorted(ch_cols, key=lambda c: int(c.split("_")[1]))
+    true_df = true_df[ch_cols_sorted]
+    pred_df = pred_df[ch_cols_sorted]
+
+    # Flatten row-major to match plot_coherent_noise() expectations
+    y_true = true_df.to_numpy().ravel(order="C")
+    y_pred = pred_df.to_numpy().ravel(order="C")
+
+    # Build matching eventid/chadc arrays
+    ev_ids = true_df.index.to_numpy()
+    nch    = len(ch_cols_sorted)
+    eventid = np.repeat(ev_ids, nch)
+    ch_nums = np.array([int(c.split("_")[1]) for c in ch_cols_sorted], dtype=int)
+    chadc   = np.tile(ch_nums, len(ev_ids))
+
+    # ERx geometry from meta
+    nch_per  = int(meta.get("nch_per_erx", 37))
+    nerx     = int(meta.get("nerx", 6))
+
+    out_dir = os.path.dirname(bundle_path)  # .../<MODEL>/analytic
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Make the plot
+    plot_coherent_noise(
+        y_true=y_true,
+        y_pred=y_pred,
+        chadc=chadc,
+        eventid=eventid,
+        nch_per_erx=nch_per,
+        nerx=nerx,
+        inputfolder="",                 # not used by the function
+        plotfolder=out_dir,
+        label_suffix=f"analytic_k{k}"   # this is appended before ".pdf"
+    )
+
+    # Rename to the exact requested filename pattern (drop the default suffix position)
+    default_path = os.path.join(out_dir, f"noise_fractions_with_ratio_{'analytic_k'+str(k)}.pdf")
+    requested_path = os.path.join(out_dir, f"noise_fractions_with_ratio__analytic_k{k}.pdf")
+    if os.path.exists(default_path):
+        try:
+            os.replace(default_path, requested_path)
+        except Exception:
+            # Fallback: it might already have the correct name depending on plot_coherent_noise
+            pass
+
+    print(f"[analytic-noise] wrote {requested_path}")
+
+def run_analytic_noise_fraction_plots(base_dir=BASE_DIR):
+    """
+    Iterate over analytic bundles and create noise_fractions_with_ratio__analytic_k*.pdf
+    under each .../<EVAL>/<TRAIN>/<MODEL>/analytic directory.
+    Respects config flags and ARCH_FILTER (model architecture).
+    """
+    if not ANALYTIC_NOISE_PLOTS_ENABLE:
+        print("[analytic-noise] Skipped (ANALYTIC_NOISE_PLOTS_ENABLE=False).")
+        return
+
+    # Modules filter
+    selected = set(ANALYTIC_NOISE_PLOTS_MODULES) if ANALYTIC_NOISE_PLOTS_MODULES else None
+
+    # Which k values to plot
+    k_list_for_plot = ANALYTIC_NOISE_PLOTS_K_LIST
+
+    for emod, tmod, model, bundle in _iter_all_analytic_bundles(base=base_dir):
+
+        # module filter
+        if selected is not None and emod not in selected:
+            continue
+
+        # architecture filter
+        if ARCH_FILTER is not None:
+            arch_str = f"in20__{'-'.join(map(str, ARCH_FILTER))}"
+            if arch_str not in model:
+                continue
+
+        # If user didn't force a k-list, read from the bundle meta (k_list saved when creating the analytic bundle)
+        if k_list_for_plot is None:
+            try:
+                with gzip.open(bundle, "rb") as f:
+                    bb = pickle.load(f)
+                k_list = tuple(int(x) for x in bb.get("meta", {}).get("k_list", (0,)))
+            except Exception:
+                k_list = (0,)
+        else:
+            k_list = tuple(k_list_for_plot)
+
+        print(f"[analytic-noise] eval={emod} | train={tmod} | model={model} | ks={k_list}")
+        for k in k_list:
+            try:
+                _make_noise_plot_from_analytic_bundle(bundle, k=int(k))
+            except Exception as e:
+                print(f"[analytic-noise] ERROR for {bundle} (k={k}): {e}")
+
+
+
 
 # ---------- Stats utilities: covariance, correlation, residuals ----------
 
@@ -596,21 +2569,17 @@ per_module_coherent_means = defaultdict(list)
 
 # ----- Parsing / grouping -----
 def parse_model_config(model_name):
-    """Parse nodes and dropout from folder name."""
-    nodes = re.search(r"__(\d+(?:-\d+)+)__", model_name)
-    if not nodes:
+    try:
+        parts = model_name.split("__")
+        nodes_str = parts[1]
+        nodes = tuple(map(int, nodes_str.split("-")))
+        dr = float(parts[2].replace("dr", ""))
+        return nodes, dr
+    except Exception:
         return None, None
-    # Tuple döndür (list yerine)
-    nodes_per_layer = tuple(int(n) for n in nodes.group(1).split("-"))
-    dr = re.search(r"__dr([0-9.]+)", model_name)
-    if not dr:
-        return None, None
-    return nodes_per_layer, float(dr.group(1))
+_MODULE_RE = re.compile(r"(ML_F3W_WXIH\d+)")
 
-_MODULE_RE = re.compile(r"ML_[A-Z0-9_]+?(?=_ML_|$)")
-
-def is_self(test_module: str, train_module: str) -> bool:
-    """SELF if test module is included in training name."""
+def is_self(test_module, train_module):
     return test_module in _MODULE_RE.findall(train_module)
 
 # ----- Results I/O -----
@@ -694,8 +2663,10 @@ def discover_modules_and_models(username_load_model_from):
         models[module] = [d for d in os.listdir(module_path) if os.path.isdir(os.path.join(module_path, d))]
     return modules, models
 
+
+"""
 def filter_existing_plots(modules, models, output_base="plots/performance"):
-    """Skip combos already logged (and/or with existing folders)."""
+    #Skip combos already logged (and/or with existing folders).
     filtered = {}
     for test_module in modules:
         combos = []
@@ -713,6 +2684,84 @@ def filter_existing_plots(modules, models, output_base="plots/performance"):
                 combos.append((train_module, model_name))
         if combos:
             filtered[test_module] = combos
+    return filtered
+"""
+def filter_existing_plots(modules, models, output_base="plots/performance"):
+    """
+    Skip combinations that are already logged (and/or have existing folders).
+    Added feature: if a module (e.g., ML_F3W_WXIH0190) contains a corrupted or
+    incomplete colnames.json file (e.g., 16 features instead of 20),
+    automatically fall back to the next module (e.g., ML_F3W_WXIH0191)
+    for the same model_name and train_module.
+    """
+    filtered = {}
+
+    for i, test_module in enumerate(modules):
+        combos = []
+        for train_module, model_list in models.items():
+            for model_name in model_list:
+                # Parse model configuration (layer structure + dropout)
+                nodes_per_layer, dropout_rate = parse_model_config(model_name)
+                if nodes_per_layer is None or dropout_rate is None:
+                    continue
+
+                key = (test_module, train_module, tuple(nodes_per_layer), dropout_rate)
+                plot_path = os.path.join(output_base, test_module, train_module, model_name)
+
+                has_results_entry = key in existing_result_keys if ENABLE_RESULTS_TXT_SKIP else False
+                has_folder = os.path.exists(plot_path) if ENABLE_FOLDER_SKIP else False
+
+                # Skip combinations that already have results or output folders
+                if (ENABLE_RESULTS_TXT_SKIP and has_results_entry) or (ENABLE_FOLDER_SKIP and has_folder):
+                    continue
+
+                # --- Sanity check: verify colnames.json validity ---
+                input_dir = os.path.join(plot_path, "dnn", "inputs")
+                colnames_path = os.path.join(input_dir, "colnames.json")
+
+                # If colnames.json exists, check its feature count
+                if os.path.exists(colnames_path):
+                    try:
+                        with open(colnames_path, "r") as f:
+                            cols = json.load(f)
+                        # Known corrupted case: 16 features instead of 20
+                        if len(cols) < 20:
+                            raise ValueError("insufficient feature count")
+                    except Exception as e:
+                        print(f"[filter] Detected invalid colnames in {test_module}: {e}")
+
+                        # Try to use the next module in sequence as fallback
+                        if i + 1 < len(modules):
+                            next_module = modules[i + 1]
+                            alt_input_dir = os.path.join(output_base, next_module, train_module, model_name, "dnn", "inputs")
+                            alt_colnames = os.path.join(alt_input_dir, "colnames.json")
+
+                            if os.path.exists(alt_colnames):
+                                with open(alt_colnames, "r") as f:
+                                    alt_cols = json.load(f)
+                                # Use fallback only if feature count matches the expected one
+                                if len(alt_cols) == 20:
+                                    print(f"[filter] Using colnames.json from {next_module} "
+                                          f"as fallback for {test_module}")
+                                    combos.append((train_module, model_name))
+                                    continue
+                                else:
+                                    print(f"[filter] Fallback colnames.json in {next_module} "
+                                          f"is also invalid (len={len(alt_cols)}). Skipping.")
+                                    continue
+                            else:
+                                print(f"[filter] No valid fallback found for {test_module}. Skipping.")
+                                continue
+                        else:
+                            print(f"[filter] {test_module} is the last module. Cannot fallback.")
+                            continue
+
+                # If everything is fine, keep this combo
+                combos.append((train_module, model_name))
+
+        if combos:
+            filtered[test_module] = combos
+
     return filtered
 
 # ----- Metrics (from plot_performance) -----
@@ -906,9 +2955,21 @@ def evaluate_model_and_compute_metrics(modulename_for_evaluation: str, train_mod
 
         return (frac_impr_mean, coh_ratio_mean)
 
+    # ======= SIMPLE GUARD: empty/missing input folder → skip early =======
+    # If the input folder does not exist or is empty, skip this module entirely.
+    if (not os.path.isdir(inputfolder)) or (len(os.listdir(inputfolder)) == 0):
+        print(f"[skip] Empty or missing input folder: {inputfolder} → skipping {modulename_for_evaluation}")
+        return None
 
-    with open(f"{inputfolder}/colnames.json") as f:
-        colnames_inputs = json.load(f)
+    # Try to open colnames.json; if missing, skip cleanly.
+    try:
+        with open(f"{inputfolder}/colnames.json") as f:
+            colnames_inputs = json.load(f)
+    except FileNotFoundError:
+        print(f"[skip] Missing colnames.json for {modulename_for_evaluation} → skipping")
+        return None
+    # ======= /guard =======
+
 
     cm_cols = [c for c in colnames_inputs if c.startswith("cm_erx")]
     ncmchannels = len(cm_cols)
@@ -1309,7 +3370,7 @@ def plot_new_numtrained_vs_coherent_by_dropout():
         xticks_vals = sorted(set(s0190_x) | set(s0198_x))
         ax = plt.gca()
         ax.xaxis.set_major_locator(FixedLocator(xticks_vals))
-        ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))  # 1.0 yerine 1 yazsın
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))
         if xticks_vals:
             plt.xlim(min(xticks_vals) - 0.5, max(xticks_vals) + 0.5)
 
@@ -1920,7 +3981,6 @@ def plot_module_cm_profiles_dr0(eval_module: str,
       - 'true'
       - 'DNN: <train_module>/<model_name>'
     """
-    import os, gzip, pickle, numpy as np
 
     bundles = []
     first_true = None
@@ -2028,7 +4088,6 @@ def aggregate_and_plot_cm_profiles_with_modules(selected_train_module: str,
         (2) DNN-only  (all modules, legend=module name)
         (3) TRUE+DNN overlay (legend='module true', 'module dnn')
     """
-    import os, numpy as np, gzip, pickle
     from collections import defaultdict
 
     true_by_cm = defaultdict(dict)
@@ -2129,7 +4188,7 @@ def reset_state():
 if __name__ == '__main__':
     reset_state()
     load_existing_results()
-
+    os.environ["USER"] = "areimers"
     username_load_model_from = "areimers"
     modules, models_dict = discover_modules_and_models(username_load_model_from)
     modules_to_process = filter_existing_plots(modules, models_dict)
@@ -2164,7 +4223,7 @@ if __name__ == '__main__':
             bundle_exists_before = os.path.exists(bundle_path)
             print(f"[evaluate] Eval={test_module} | Train={train_module} | Model={model_name} | bundle_exists={bundle_exists_before}")
 
-            frac_impr_mean, coh_ratio_mean = evaluate_model_and_compute_metrics(
+            res = evaluate_model_and_compute_metrics(
                 modulename_for_evaluation=test_module,
                 train_module=train_module,
                 model_name=model_name,
@@ -2172,6 +4231,12 @@ if __name__ == '__main__':
                 write_bundle=not bundle_exists_before,  # do not overwrite if bundle already exists
                 write_plots=False                      # always draw plots later from bundle
             )
+
+            # If the module was empty/missing, we get None → skip everything for this combo.
+            if res is None:
+                continue
+
+            frac_impr_mean, coh_ratio_mean = res
 
             register_result(
                 test_module, train_module, nodes_per_layer, dropout_rate,
@@ -2241,6 +4306,7 @@ if __name__ == '__main__':
                             output_filename=os.path.join(prof_dir, f"profiles_residuals_{cm_name}.pdf"),
                             nbins_x=50
                         )
+
             else:
                 print("[warn] Bundle not found; ensure evaluate() writes it when bundle is missing.")
 
@@ -2326,3 +4392,28 @@ if __name__ == '__main__':
 
 
     run_global_covcorr()
+    run_analytic_jobs(username_load_model_from="areimers")
+
+    # === Run analytic noise plots (from analytic bundles) ===
+    run_analytic_noise_fraction_plots(base_dir=BASE_DIR)
+
+    # --- Analytic global cov/corr (k=0) ---
+    run_analytic_global_covcorr()
+
+    # =======  Projection histograms =========
+    run_projection_hists()
+
+    if ENABLE_DISTCORR_PLOTS:
+        run_distance_corr_plots()
+
+    if ENABLE_MULTIPLE_INPUT_EXPORT:
+        run_multiple_input_export()
+
+    if ENABLE_MULTI_INPUT_DNN_INFERENCE:
+        run_multi_input_dnn_inference(username_load_model_from="areimers")
+
+
+    run_build_multi_inputs_from_modules()
+
+
+    run_multi_dnn_postprocess_only()
