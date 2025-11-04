@@ -5,7 +5,8 @@ import pandas as pd
 from dataclasses import dataclass
 import evaluate_performance as ep  # Import analytic & plotting utilities
 from dataclasses import dataclass, field
-
+import gzip
+import pickle
 # ============================================================
 # Configuration Class
 # ============================================================
@@ -21,24 +22,33 @@ class CompareConfig:
     plots_output_dir: str = "./plots/performance"
     reference_module: str = "ML_F3W_WXIH0191"
 
-    enable_plots: bool = False
+    #Analytic Calculations with dnn_inputs
+    enable_plots: bool = True
     skip_existing_data: bool = True     # Skip analytic data if residual.pkl exists
     skip_existing_plots: bool = True    # Skip plot generation if plot folder exists
     drop_constant_cm: bool = True
     verbose: bool = True
 
     # --- DNN configuration ---
-    run_dnn_predict: bool = True
-    enable_dnn_plots: bool = True
+    run_dnn_predict: bool = False
+    enable_dnn_plots: bool = False
     dnn_model_subpath: str = "dnn/dnn_models/in20__512-512-512-512-64__dr0"
     dnn_weights_name: str = "regression_dnn_best.pth"
-    target_modules: list[str] = field(default_factory=lambda: ["ML_F3W_WXIH0193"])
+    target_modules: list[str] = field(default_factory=lambda: ["ML_F3W_WXIH0191"])
 
     nodes_per_layer: list = None
     dropout_rate: float = 0.0
     modeltag: str = ""
     ncmchannels: int = 12
     nch_per_erx: int = 37
+
+    # --- Analytic residuals configuration ---
+    enable_analytic_residuals: bool = False
+    analytic_residual_modules: list[str] = field(default_factory=lambda: ["ML_F3W_WXIH0191"])
+    analytic_residual_input_root: str = "/eos/user/g/gmihriye/CM/compare_methods/CMCorrection/analytic_residuals/inputs"
+    analytic_residual_output_root: str = "/eos/user/g/gmihriye/CM/compare_methods/CMCorrection/analytic_residuals/outputs"
+    analytic_residual_plots_root: str = "./plots/performance"
+
 
     def __post_init__(self):
         if self.nodes_per_layer is None:
@@ -129,6 +139,16 @@ def run_dnn_prediction_for_module(cfg, module):
     io.load_all()
     split = io.get_split("combined")
 
+    # --- Ensure cm_df has the same index and shape as measurements_df (same as evaluate_performance)
+    if "eventid" in split.cm_df.columns:
+        split.cm_df = split.cm_df.groupby("eventid").first()
+
+    split.cm_df.index = split.measurements_df.index
+    split.cm_df = split.cm_df.loc[:, ~split.cm_df.columns.duplicated()]
+    split.cm_df = split.cm_df.reindex(sorted(split.cm_df.columns), axis=1)
+
+
+
     input_dim = inputs_combined.shape[1]
     model = DNNFlex(input_dim, cfg.nodes_per_layer, cfg.dropout_rate)
     inferencer = ep.DNNInferencer(model=model, weights_path=weights_path, dtype=np.float32, batch_size=16384)
@@ -140,7 +160,7 @@ def run_dnn_prediction_for_module(cfg, module):
     np.save(os.path.join(dnn_output_dir, f"predictions_{module}_combined.npy"), preds_flat)
     preds_df.to_pickle(os.path.join(dnn_output_dir, f"predictions_{module}_combined.pkl"))
 
-    preds_df_with_cm = ep.add_cms_to_measurements_df(preds_df, split.cm_df, drop_constant_cm=False)
+    preds_df_with_cm = ep.add_cms_to_measurements_df(preds_df, split.cm_df, drop_constant_cm=True)
     preds_df_with_cm.to_pickle(os.path.join(dnn_output_dir, f"predictions_{module}_withCM_combined.pkl"))
     print(f"[OK] DNN predictions (with CM) saved → {dnn_output_dir}")
 
@@ -153,7 +173,7 @@ def run_dnn_prediction_for_module(cfg, module):
     meas_true = meas_true.loc[preds_df.index]
 
     residual_dnn = meas_true - preds_df
-    residual_dnn_with_cm = ep.add_cms_to_measurements_df(residual_dnn, split.cm_df, drop_constant_cm=False)
+    residual_dnn_with_cm = ep.add_cms_to_measurements_df(residual_dnn, split.cm_df, drop_constant_cm=True)
 
     residual_dnn.to_pickle(os.path.join(dnn_output_dir, f"residual_dnn_{module}.pkl"))
     residual_dnn_with_cm.to_pickle(os.path.join(dnn_output_dir, f"residual_dnn_{module}_withCM.pkl"))
@@ -194,8 +214,37 @@ def compare_methods(cfg: CompareConfig):
         residual_file = os.path.join(analytic_output_dir, "residual.pkl")
         data_exists = os.path.exists(residual_file)
 
+        # --- Define eval_cfg always (needed for plots even if analytic skipped)
+        eval_cfg = ep.EvalConfig(
+            modulenames_used_for_training=[module],
+            modulename_for_evaluation=module,
+            nodes_per_layer=cfg.nodes_per_layer,
+            dropout_rate=cfg.dropout_rate,
+            modeltag=cfg.modeltag,
+            inputfoldertag="",
+            ncmchannels=cfg.ncmchannels,
+            nch_per_erx=cfg.nch_per_erx,
+        )
+
+
+        """
         if cfg.skip_existing_data and data_exists:
             print(f"[SKIP] Analytic data already exist for {module}, skipping computation.")
+            #continue
+        """
+        if cfg.skip_existing_data and data_exists:
+            print(f"[SKIP] Analytic data already exist for {module}, reloading saved data.")
+            analytic_output_dir = os.path.join(cfg.base_output_dir, module, "analytic")
+
+            # Load previously saved analytic results so variables exist
+            # Load previously saved analytic results so variables exist
+            try:
+                meas_true = pd.read_pickle(os.path.join(analytic_output_dir, "meas_true.pkl"))
+                analytic_pred = pd.read_pickle(os.path.join(analytic_output_dir, "analytic_pred.pkl"))
+                residual = pd.read_pickle(os.path.join(analytic_output_dir, "residual.pkl"))
+            except Exception as e:
+                raise RuntimeError(f"[ERROR] Could not reload analytic data for {module}: {e}")
+
         else:
             # --- Step 4: Colnames consistency check
             fixed_colnames_path = check_colnames_consistency(module_dir, reference_module_dir)
@@ -217,23 +266,30 @@ def compare_methods(cfg: CompareConfig):
             io.load_all()
             split = io.get_split("combined")
 
-            analytic.fit(split)
-            analytic_pred = analytic.predict(split_predict=split, split_correction=split)
-            meas_true = split.measurements_df
 
+            analytic.fit(split)
+            analytic_pred = analytic.predict_k(split_predict=split, split_correction=split, k=0)
+
+            meas_true = split.measurements_df
             assert np.array_equal(meas_true.index, analytic_pred.index)
 
+            # Residual = true - analytic_pred (exactly as evaluate_performance)
+            residual_df = meas_true - analytic_pred
 
-            residual = pd.DataFrame({
-                "adc": (meas_true - analytic_pred).mean(axis=1).to_numpy()
-            })
-
+            # Save in same structure (no stack/reset_index difference)
+            residual = residual_df
             # --- Step 7: Save analytic outputs
+            """
             meas_true.to_pickle(os.path.join(analytic_output_dir, "meas_true.pkl"))
             analytic_pred.to_pickle(os.path.join(analytic_output_dir, "analytic_pred.pkl"))
             residual.to_pickle(os.path.join(analytic_output_dir, "residual.pkl"))
-            print(f"[OK] Analytic results saved → {analytic_output_dir}")
+            """
+            meas_true.to_pickle(os.path.join(analytic_output_dir, "meas_true.pkl.gz"), compression="gzip")
+            analytic_pred.to_pickle(os.path.join(analytic_output_dir, "analytic_pred.pkl.gz"), compression="gzip")
+            residual.to_pickle(os.path.join(analytic_output_dir, "residual.pkl.gz"), compression="gzip")
 
+            print(f"[OK] Analytic results saved → {analytic_output_dir}")
+            """
             # --- Step 8: Export analytic outputs for DNN (train/val)
             n = len(analytic_pred)
             n_train = int(0.8 * n)
@@ -260,6 +316,53 @@ def compare_methods(cfg: CompareConfig):
                 json.dump(kept_cols, f)
 
             print(f"[OK] Exported DNN-ready inputs (~{len(kept_cols)}) and targets → {dnn_output_dir}")
+            """
+        # --- Step 8: Prepare DNN-ready data (copy Areimers inputs + create analytic residual targets)
+
+        print(f"[INFO] Preparing DNN-ready residual targets for {module}...")
+
+        # ① Copy original DNN input files
+        original_input_dir = os.path.join(cfg.base_input_dir, module)
+        dnn_output_dir = os.path.join(cfg.base_output_dir, module, "dnn", "dnn_inputs")
+        os.makedirs(dnn_output_dir, exist_ok=True)
+
+        inputs_train_path  = os.path.join(original_input_dir, "inputs_train.npy")
+        inputs_val_path    = os.path.join(original_input_dir, "inputs_val.npy")
+        indices_train_path = os.path.join(original_input_dir, "indices_train.npy")
+        indices_val_path   = os.path.join(original_input_dir, "indices_val.npy")
+
+        required_files = [inputs_train_path, inputs_val_path, indices_train_path, indices_val_path]
+        if not all(os.path.exists(p) for p in required_files):
+            raise FileNotFoundError(f"[ERROR] Missing Areimers input files for {module}!")
+
+        import shutil
+        for fname in ["inputs_train.npy", "inputs_val.npy", "indices_train.npy", "indices_val.npy", "colnames.json"]:
+            src = os.path.join(original_input_dir, fname)
+            dst = os.path.join(dnn_output_dir, fname)
+            if os.path.exists(src):
+                shutil.copy(src, dst)
+                print(f"[COPY] {fname} copied from dnn inputs folder.")
+            else:
+                print(f"[WARN] Missing file: {src}")
+
+        # ② Compute analytic residuals and flatten
+        residual_df = meas_true - analytic_pred
+        residual_flat = residual_df.to_numpy(dtype=np.float32).reshape(-1, 1, order="C")
+
+        # ③ Split residuals into train and validation sets using Areimers' indices
+        idx_train = np.load(indices_train_path)
+        idx_val   = np.load(indices_val_path)
+
+        targets_train = residual_flat[idx_train]
+        targets_val   = residual_flat[idx_val]
+
+        # ④ Save the new analytic residual targets
+        np.save(os.path.join(dnn_output_dir, "targets_train.npy"), targets_train)
+        np.save(os.path.join(dnn_output_dir, "targets_val.npy"), targets_val)
+
+        print(f"[OK] Analytic residual targets saved → {dnn_output_dir}")
+        print(f"     → targets_train: {targets_train.shape}, targets_val: {targets_val.shape}")
+
 
         # --- Run DNN prediction only for selected modules ---
         if cfg.run_dnn_predict:
@@ -354,6 +457,28 @@ def compare_methods(cfg: CompareConfig):
 
                 print(f"[OK] Analytic plots saved under {plot_dir}")
 
+                # --- Additional: Noise fraction ratio plot for analytic ---
+                noise_plot_dir = os.path.join(plot_dir, "noise_fraction_ratio")
+                os.makedirs(noise_plot_dir, exist_ok=True)
+
+                variants_for_noise = {
+                    "true": split.measurements_df
+                }
+                residuals_for_noise = {
+                    "analytic": residual
+                }
+
+                ep.compute_and_plot_coherent_noise(
+                    split_name="combined",
+                    cfg=eval_cfg,
+                    variants=variants_for_noise,
+                    residuals=residuals_for_noise,
+                    plot_dir=noise_plot_dir,
+                    trunc_fracs=(1.0,)
+                )
+
+                print(f"[OK] Analytic noise fraction ratio saved → {noise_plot_dir}")
+
         # --- Step 10: DNN plots ---
         if cfg.enable_dnn_plots and (cfg.target_modules is None or module in cfg.target_modules):
             print(f"[PLOTS] Generating DNN plots for {module}...")
@@ -411,9 +536,147 @@ def compare_methods(cfg: CompareConfig):
 
             print(f"[OK] DNN plots saved under {plot_dir_dnn}")
 
+            # --- Additional: Noise fraction ratio plot for DNN ---
+            noise_plot_dir_dnn = os.path.join(plot_dir_dnn, "noise_fraction_ratio")
+            os.makedirs(noise_plot_dir_dnn, exist_ok=True)
+
+            variants_for_noise = {
+                "true": split.measurements_df
+            }
+            residuals_for_noise = {
+                "dnn": residual_dnn
+            }
+
+            ep.compute_and_plot_coherent_noise(
+                split_name="combined",
+                cfg=eval_cfg,
+                variants=variants_for_noise,
+                residuals=residuals_for_noise,
+                plot_dir=noise_plot_dir_dnn,
+                trunc_fracs=(1.0,)
+            )
+
+            print(f"[OK] DNN noise fraction ratio saved → {noise_plot_dir_dnn}")
+
+
+        # --- Step 11: Analytic residuals processing ---
+        if cfg.enable_analytic_residuals and (cfg.analytic_residual_modules is None or module in cfg.analytic_residual_modules):
+            run_analytic_residuals(cfg, module)
+
+
 
     print("\n[COMPLETE] compare_methods pipeline finished successfully!\n")
 
+
+def run_analytic_residuals(cfg, module):
+    """
+    Perform analytic inference on residuals obtained from DNN predictions.
+    Input residuals are read from dnn_outputs, processed analytically,
+    and results + plots are stored in configured output directories.
+    """
+
+    print(f"\n[ANALYTIC-RESIDUAL] Processing module: {module}")
+
+    # Define paths
+    input_dir = os.path.join(cfg.analytic_residual_input_root, module)
+    os.makedirs(input_dir, exist_ok=True)
+
+    dnn_residual_path = os.path.join(cfg.base_output_dir, module, "dnn", "dnn_outputs", f"residual_dnn_{module}.pkl")
+    if not os.path.exists(dnn_residual_path):
+        print(f"[SKIP] Missing DNN residual for {module}, skipping analytic residual computation.")
+        return
+
+    residual_df = pd.read_pickle(dnn_residual_path)
+
+    # Load CM data from analytic base
+    analytic_dir = os.path.join(cfg.base_output_dir, module, "analytic")
+    cm_ref_path = os.path.join(analytic_dir, "meas_true.pkl")  # reuse structure to get cm_df
+    eval_cfg = ep.EvalConfig(
+        modulenames_used_for_training=[module],
+        modulename_for_evaluation=module,
+        nodes_per_layer=cfg.nodes_per_layer,
+        dropout_rate=cfg.dropout_rate,
+        modeltag=cfg.modeltag,
+        inputfoldertag="",
+        ncmchannels=cfg.ncmchannels,
+        nch_per_erx=cfg.nch_per_erx,
+    )
+    io = ep.DataIO(eval_cfg)
+    io.load_all()
+    split = io.get_split("combined")
+
+    # Fit analytic model directly on residuals
+    analytic = ep.AnalyticInferencer(drop_constant_cm=cfg.drop_constant_cm)
+    analytic.fit(split)
+    analytic_pred_residual = analytic.predict(split_predict=split, split_correction=split)
+
+    # Compute corrected residuals
+    residual_corrected = residual_df - analytic_pred_residual
+
+    # Save outputs
+    output_dir = os.path.join(cfg.base_output_dir, module, "analytic_residual")
+    os.makedirs(output_dir, exist_ok=True)
+    residual_df.to_pickle(os.path.join(output_dir, f"residual_input_{module}.pkl"))
+    analytic_pred_residual.to_pickle(os.path.join(output_dir, f"analytic_pred_residual_{module}.pkl"))
+    residual_corrected.to_pickle(os.path.join(output_dir, f"residual_corrected_{module}.pkl"))
+
+    print(f"[OK] Analytic residual outputs saved → {output_dir}")
+
+    # --- Generate plots ---
+    plot_dir = os.path.join(cfg.analytic_residual_plots_root, module, "analytic_residuals")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    variants = {
+        "true": residual_df,  # required by evaluate_performance.plot_all_eigenvectors()
+        "residual": residual_df,
+        "analytic_residual": analytic_pred_residual
+    }
+
+
+    variants_with_cms = {
+        k: ep.add_cms_to_measurements_df(v, split.cm_df, drop_constant_cm=False)
+        for k, v in variants.items()
+    }
+    residuals_with_cms = {
+        "analytic_residual": ep.add_cms_to_measurements_df(residual_corrected, split.cm_df, drop_constant_cm=False)
+    }
+
+
+    ep.plot_cov_corr("combined", eval_cfg, variants_with_cms, residuals_with_cms, os.path.join(plot_dir, "covcorr"))
+    ep.plot_dist_corr("combined", eval_cfg, variants_with_cms, residuals_with_cms, split.cm_df, os.path.join(plot_dir, "distcorr"))
+    ep.plot_delta_lin_dist_corr("combined", eval_cfg, variants_with_cms, residuals_with_cms, split.cm_df, os.path.join(plot_dir, "delta_lin_dist_corr"))
+    ep.plot_all_eigenvalues("combined", variants_with_cms, residuals_with_cms, os.path.join(plot_dir, "eigenvalues_cmincl"))
+    ep.plot_all_eigenvectors(eval_cfg, "combined", variants_with_cms, residuals_with_cms, 3, os.path.join(plot_dir, "eigenvectors_cmincl"))
+    ep.plot_all_projection_hists("combined", variants, residuals, split.cm_df, 3, os.path.join(plot_dir, "eigenprojections"))
+
+    print(f"[OK] Analytic residual plots saved under {plot_dir}\n")
+
+    # --- Additional: Noise fraction ratio plot for analytic_residual ---
+    noise_plot_dir_ar = os.path.join(plot_dir, "noise_fraction_ratio")
+    os.makedirs(noise_plot_dir_ar, exist_ok=True)
+
+    # true = original DNN residuals, residual = analytically corrected residuals
+    dnn_residual_path = os.path.join(
+        cfg.base_output_dir, module, "dnn", "dnn_outputs", f"residual_dnn_{module}.pkl"
+    )
+    if os.path.exists(dnn_residual_path):
+        residual_dnn = pd.read_pickle(dnn_residual_path)
+        variants_for_noise = {"true": residual_dnn}
+    else:
+        variants_for_noise = {"true": split.measurements_df}
+
+    residuals_for_noise = {"analytic_residual": residual_corrected}
+
+    ep.compute_and_plot_coherent_noise(
+        split_name="combined",
+        cfg=eval_cfg,
+        variants=variants_for_noise,
+        residuals=residuals_for_noise,
+        plot_dir=noise_plot_dir_ar,
+        trunc_fracs=(1.0,)
+    )
+
+    print(f"[OK] Analytic residual noise fraction ratio saved → {noise_plot_dir_ar}")
 
 # ============================================================
 # Main Execution
